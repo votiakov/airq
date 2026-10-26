@@ -1,0 +1,73 @@
+# golangci-lint v2 configuration. Run locally with `make lint`; CI pins the same version.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose # unclosed HTTP response bodies leak connections
+    - copyloopvar
+    - errorlint # errors.Is/As instead of == and type assertions
+    - exhaustive # switches over enums must handle every case
+    - fatcontext
+    - gocritic
+    - gosec # security static analysis
+    - intrange
+    - misspell
+    - nilerr
+    - noctx # outbound HTTP/SQL must carry a context
+    - promlinter # Prometheus metric naming conventions
+    - revive
+    - rowserrcheck
+    - sloglint
+    - sqlclosecheck
+    - unconvert
+    - unparam
+    - usestdlibvars
+  settings:
+    exhaustive:
+      default-signifies-exhaustive: true
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment # readability over a few bytes of padding
+        - shadow
+    revive:
+      rules:
+        - name: exported
+          disabled: true # package docs carry the contract; per-symbol docs where useful
+        - name: package-comments
+        - name: var-naming
+        - name: indent-error-flow
+        - name: errorf
+        - name: error-return
+        - name: error-strings
+        - name: receiver-naming
+        - name: unused-parameter
+        - name: context-as-argument
+    sloglint:
+      no-mixed-args: true
+      context: scope
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - gosec
+          - noctx
+          - unparam
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/votiakov/airq
