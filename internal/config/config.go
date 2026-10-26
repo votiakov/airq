@@ -50,11 +50,16 @@ type HTTP struct {
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"20s"`
 	// DrainDelay is how long the service keeps serving (while reporting not-ready)
 	// after SIGTERM so load balancers can deregister it before connections are closed.
-	DrainDelay        time.Duration `env:"DRAIN_DELAY"          envDefault:"5s"`
-	MaxInFlight       int           `env:"MAX_IN_FLIGHT"        envDefault:"256"`
-	RateLimitRPS      float64       `env:"RATE_LIMIT_RPS"       envDefault:"10"`
-	RateLimitBurst    int           `env:"RATE_LIMIT_BURST"     envDefault:"20"`
-	TrustProxyHeaders bool          `env:"TRUST_PROXY_HEADERS"  envDefault:"false"`
+	DrainDelay     time.Duration `env:"DRAIN_DELAY"          envDefault:"5s"`
+	MaxInFlight    int           `env:"MAX_IN_FLIGHT"        envDefault:"256"`
+	RateLimitRPS   float64       `env:"RATE_LIMIT_RPS"       envDefault:"10"`
+	RateLimitBurst int           `env:"RATE_LIMIT_BURST"     envDefault:"20"`
+	// MissRateLimitRPS/Burst cap how many cache misses (each of which spends vendor
+	// quota) one client may cause. It is kept well below UPSTREAM_RATE_LIMIT_RPS so a
+	// single client cannot drain the quota every other client needs for new locations.
+	MissRateLimitRPS   float64 `env:"MISS_RATE_LIMIT_RPS"   envDefault:"2"`
+	MissRateLimitBurst int     `env:"MISS_RATE_LIMIT_BURST" envDefault:"20"`
+	TrustProxyHeaders  bool    `env:"TRUST_PROXY_HEADERS"  envDefault:"false"`
 }
 
 // Health configures dependency checks.
@@ -87,7 +92,13 @@ type Upstream struct {
 	MaxConcurrent    int           `env:"MAX_CONCURRENT"     envDefault:"16"`
 	BreakerThreshold int           `env:"BREAKER_THRESHOLD"  envDefault:"5"`
 	BreakerCooldown  time.Duration `env:"BREAKER_COOLDOWN"   envDefault:"30s"`
-	MaxResponseBytes int64         `env:"MAX_RESPONSE_BYTES" envDefault:"1048576"`
+	// The circuit also opens when this fraction of calls within BREAKER_WINDOW failed
+	// (at least BREAKER_MIN_CALLS of them), catching a vendor that fails intermittently.
+	// 0 disables the ratio trip.
+	BreakerFailureRatio float64       `env:"BREAKER_FAILURE_RATIO" envDefault:"0.5"`
+	BreakerMinCalls     int           `env:"BREAKER_MIN_CALLS"     envDefault:"20"`
+	BreakerWindow       time.Duration `env:"BREAKER_WINDOW"        envDefault:"1m"`
+	MaxResponseBytes    int64         `env:"MAX_RESPONSE_BYTES" envDefault:"1048576"`
 }
 
 // Cache configures the in-memory response caches.
@@ -100,6 +111,10 @@ type Cache struct {
 	// StaleFor is how long past expiry an entry is kept so it can be served when the
 	// upstream is failing (stale-if-error).
 	StaleFor time.Duration `env:"STALE_FOR" envDefault:"1h"`
+	// RevalidateWindow is stale-while-revalidate: for this long after expiry an entry is
+	// served immediately while one background fetch refreshes it, so popular keys never
+	// make a client wait on the vendor. 0 disables it.
+	RevalidateWindow time.Duration `env:"REVALIDATE_WINDOW" envDefault:"30s"`
 }
 
 // DB configures PostgreSQL access and the asynchronous response recorder.
@@ -187,6 +202,8 @@ func (c *Config) validate() error {
 	l.check(h.MaxInFlight >= 1, "HTTP_MAX_IN_FLIGHT must be at least 1")
 	l.rate("HTTP_RATE_LIMIT_RPS", h.RateLimitRPS)
 	l.check(h.RateLimitBurst >= 1, "HTTP_RATE_LIMIT_BURST must be at least 1")
+	l.rate("HTTP_MISS_RATE_LIMIT_RPS", h.MissRateLimitRPS)
+	l.check(h.MissRateLimitBurst >= 1, "HTTP_MISS_RATE_LIMIT_BURST must be at least 1")
 
 	l.check(c.Health.CacheTTL >= 0, "HEALTH_CACHE_TTL must not be negative")
 	l.positive("HEALTH_INTERVAL", c.Health.Interval)
@@ -203,6 +220,9 @@ func (c *Config) validate() error {
 	l.check(u.MaxConcurrent >= 1, "UPSTREAM_MAX_CONCURRENT must be at least 1")
 	l.check(u.BreakerThreshold >= 1, "UPSTREAM_BREAKER_THRESHOLD must be at least 1")
 	l.positive("UPSTREAM_BREAKER_COOLDOWN", u.BreakerCooldown)
+	l.check(u.BreakerFailureRatio >= 0 && u.BreakerFailureRatio <= 1, "UPSTREAM_BREAKER_FAILURE_RATIO must be between 0 and 1")
+	l.check(u.BreakerMinCalls >= 1, "UPSTREAM_BREAKER_MIN_CALLS must be at least 1")
+	l.positive("UPSTREAM_BREAKER_WINDOW", u.BreakerWindow)
 	l.check(u.MaxResponseBytes >= 1<<10, "UPSTREAM_MAX_RESPONSE_BYTES must be at least 1024")
 	l.check(c.HTTP.RequestTimeout >= u.AttemptTimeout,
 		"HTTP_REQUEST_TIMEOUT (%s) must be >= UPSTREAM_ATTEMPT_TIMEOUT (%s)", c.HTTP.RequestTimeout, u.AttemptTimeout)
@@ -214,6 +234,7 @@ func (c *Config) validate() error {
 	l.positive("CACHE_GEOCODE_TTL", ca.GeocodeTTL)
 	l.positive("CACHE_NOT_FOUND_TTL", ca.NotFoundTTL)
 	l.check(ca.StaleFor >= 0, "CACHE_STALE_FOR must not be negative")
+	l.check(ca.RevalidateWindow >= 0, "CACHE_REVALIDATE_WINDOW must not be negative")
 
 	d := c.DB
 	l.check(d.MaxOpenConns >= 1, "DB_MAX_OPEN_CONNS must be at least 1")

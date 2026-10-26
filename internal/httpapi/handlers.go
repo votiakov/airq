@@ -34,6 +34,7 @@ type api struct {
 	svc         Service
 	attribution string
 	log         *slog.Logger
+	m           *metrics
 }
 
 type currentResponse struct {
@@ -130,9 +131,15 @@ func (a *api) resolve(ctx context.Context, t target) (*airquality.Location, airq
 // returned: clients get a stable code and a generic message.
 func (a *api) fail(w http.ResponseWriter, r *http.Request, err error) {
 	var uerr *upstream.Error
+	var mbe *airquality.MissBudgetError
 	switch {
 	case errors.Is(err, airquality.ErrLocationNotFound):
 		writeProblem(w, r, http.StatusNotFound, "location_not_found", "No location matches the given name.")
+	case errors.As(err, &mbe):
+		a.m.rejected.WithLabelValues("miss_limited").Inc()
+		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(max(mbe.RetryAfter, time.Second).Seconds()))))
+		writeProblem(w, r, http.StatusTooManyRequests, "rate_limited",
+			"Too many requests for locations that are not cached; slow down or retry shortly.")
 	case errors.As(err, &uerr):
 		a.failUpstream(w, r, uerr)
 	case errors.Is(err, context.Canceled):
@@ -150,12 +157,17 @@ func (a *api) failUpstream(w http.ResponseWriter, r *http.Request, uerr *upstrea
 	case upstream.KindCanceled:
 		clientGone(w)
 	case upstream.KindCircuitOpen, upstream.KindThrottled, upstream.KindRateLimited:
-		retry := max(uerr.RetryAfter, time.Second)
+		retry := min(max(uerr.RetryAfter, time.Second), upstream.MaxRetryAfter)
 		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(retry.Seconds()))))
 		writeProblem(w, r, http.StatusServiceUnavailable, "upstream_unavailable",
 			"The air quality provider is temporarily unavailable and no cached data exists for this location.")
 	case upstream.KindTimeout:
 		writeProblem(w, r, http.StatusGatewayTimeout, "upstream_timeout", "The air quality provider did not respond in time.")
+	case upstream.KindRejected:
+		// The vendor refuses us (revoked key, exhausted plan, retired endpoint). Only an
+		// operator can fix that, so make it loud; clients just see a bad gateway.
+		a.log.ErrorContext(r.Context(), "provider refused our request", slog.String("error", uerr.Error()))
+		writeProblem(w, r, http.StatusBadGateway, "upstream_rejected", "The air quality provider rejected the request.")
 	case upstream.KindClient:
 		// Our validation should make this impossible; if it happens it is our bug.
 		a.log.ErrorContext(r.Context(), "provider rejected a request that passed validation",
@@ -190,16 +202,23 @@ func writeResult(w http.ResponseWriter, r *http.Request, body any, status airqua
 	h.Set("Content-Type", "application/json; charset=utf-8")
 	h.Set("ETag", etag)
 	h.Set("Age", strconv.Itoa(int(age.Seconds())))
+	// max-age is the whole freshness lifetime counted from when the vendor data was
+	// fetched, because caches subtract Age from it themselves. Sending only the
+	// remaining TTL would make them subtract the age twice.
+	lifetime := int((age + ttl).Seconds())
 	h.Set("X-Cache", strings.ToUpper(string(status)))
 	switch status {
 	case airquality.CacheStale:
 		h.Set("Cache-Control", "no-cache")
 		h.Set("Cache-Status", "airq; hit; detail=stale-if-error")
+	case airquality.CacheRevalidating:
+		h.Set("Cache-Control", "no-cache")
+		h.Set("Cache-Status", "airq; hit; detail=stale-while-revalidate")
 	case airquality.CacheMiss:
-		h.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(ttl.Seconds())))
+		h.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", lifetime))
 		h.Set("Cache-Status", fmt.Sprintf("airq; fwd=miss; stored; ttl=%d", int(ttl.Seconds())))
 	default:
-		h.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(ttl.Seconds())))
+		h.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", lifetime))
 		h.Set("Cache-Status", fmt.Sprintf("airq; hit; ttl=%d", int(ttl.Seconds())))
 	}
 

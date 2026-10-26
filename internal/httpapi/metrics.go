@@ -32,7 +32,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		}),
 		rejected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Subsystem: sub, Name: "rejected_requests_total",
-			Help: "API requests rejected before reaching a handler, by reason (rate_limited, overloaded).",
+			Help: "API requests rejected before reaching a handler, by reason (rate_limited, miss_limited, overloaded).",
 		}, []string{"reason"}),
 		panics: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: ns, Subsystem: sub, Name: "panics_recovered_total",
@@ -41,6 +41,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 	}
 	reg.MustRegister(m.requests, m.duration, m.inFlight, m.rejected, m.panics)
 	m.rejected.WithLabelValues("rate_limited")
+	m.rejected.WithLabelValues("miss_limited")
 	m.rejected.WithLabelValues("overloaded")
 	return m
 }

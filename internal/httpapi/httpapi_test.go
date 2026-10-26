@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -646,4 +647,148 @@ func counterVec(t *testing.T, reg *prometheus.Registry, name string, labels map[
 	g := prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_value", Help: "test"})
 	g.Set(total)
 	return g
+}
+
+func TestMaxAgeIsTheWholeLifetimeSoCachesDoNotSubtractAgeTwice(t *testing.T) {
+	svc := okService()
+	svc.current = func(context.Context, airquality.Coordinates) (airquality.Result[airquality.Current], error) {
+		return airquality.Result[airquality.Current]{Status: airquality.CacheHit, Age: 4 * time.Minute, TTL: 6 * time.Minute}, nil
+	}
+	rec := newHarness(t, svc, nil).do(t, http.MethodGet, "/v1/air-quality/current?lat=1&lon=1", nil)
+	// Fetched 4 minutes ago with a 10 minute lifetime: Age: 240 and max-age: 600 tell a
+	// downstream cache there are 360 seconds left. max-age: 360 would tell it there are 120.
+	if rec.Header().Get("Age") != "240" || rec.Header().Get("Cache-Control") != "public, max-age=600" {
+		t.Errorf("Age=%q Cache-Control=%q", rec.Header().Get("Age"), rec.Header().Get("Cache-Control"))
+	}
+	if !strings.Contains(rec.Header().Get("Cache-Status"), "ttl=360") {
+		t.Errorf("Cache-Status = %q, want the remaining ttl", rec.Header().Get("Cache-Status"))
+	}
+}
+
+func TestRevalidatingResponseHeaders(t *testing.T) {
+	svc := okService()
+	svc.current = func(context.Context, airquality.Coordinates) (airquality.Result[airquality.Current], error) {
+		return airquality.Result[airquality.Current]{Status: airquality.CacheRevalidating, Age: 10*time.Minute + 5*time.Second}, nil
+	}
+	rec := newHarness(t, svc, nil).do(t, http.MethodGet, "/v1/air-quality/current?lat=1&lon=1", nil)
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Cache") != "REVALIDATING" ||
+		rec.Header().Get("Cache-Control") != "no-cache" ||
+		!strings.Contains(rec.Header().Get("Cache-Status"), "stale-while-revalidate") {
+		t.Fatalf("status=%d headers=%v", rec.Code, rec.Header())
+	}
+}
+
+func TestVendorRefusalIsLoudInLogsAndGenericToClients(t *testing.T) {
+	svc := okService()
+	svc.current = func(context.Context, airquality.Coordinates) (airquality.Result[airquality.Current], error) {
+		return airquality.Result[airquality.Current]{}, &upstream.Error{Kind: upstream.KindRejected, StatusCode: 403, Reason: "plan exhausted"}
+	}
+	h := newHarness(t, svc, nil)
+	rec := h.do(t, http.MethodGet, "/v1/air-quality/current?lat=1&lon=1", nil)
+	if p := decodeProblem(t, rec); rec.Code != 502 || p.Code != "upstream_rejected" {
+		t.Fatalf("status=%d problem=%+v", rec.Code, p)
+	}
+	if strings.Contains(rec.Body.String(), "plan exhausted") {
+		t.Error("vendor reason must not reach clients")
+	}
+	if !strings.Contains(h.logs.String(), `"level":"ERROR"`) || !strings.Contains(h.logs.String(), "provider refused our request") {
+		t.Errorf("a vendor refusal needs an operator: %s", h.logs)
+	}
+}
+
+func TestVendorRetryAfterIsBoundedForClients(t *testing.T) {
+	svc := okService()
+	svc.current = func(context.Context, airquality.Coordinates) (airquality.Result[airquality.Current], error) {
+		return airquality.Result[airquality.Current]{}, &upstream.Error{Kind: upstream.KindRateLimited, RetryAfter: 24 * time.Hour}
+	}
+	rec := newHarness(t, svc, nil).do(t, http.MethodGet, "/v1/air-quality/current?lat=1&lon=1", nil)
+	if got := rec.Header().Get("Retry-After"); got != "120" {
+		t.Errorf("Retry-After = %q, want 120", got)
+	}
+}
+
+// providerStub lets a real airquality.Service run behind the handler.
+type providerStub struct{ calls atomic.Int32 }
+
+func (p *providerStub) Current(_ context.Context, c airquality.Coordinates) (airquality.Current, error) {
+	p.calls.Add(1)
+	return airquality.Current{Coordinates: c}, nil
+}
+
+func (p *providerStub) Forecast(context.Context, airquality.Coordinates, int) (airquality.Forecast, error) {
+	return airquality.Forecast{}, nil
+}
+
+func (p *providerStub) Geocode(context.Context, string, string) ([]airquality.Location, error) {
+	return nil, nil
+}
+
+func TestOneClientCannotSpendTheWholeVendorBudget(t *testing.T) {
+	stub := &providerStub{}
+	svc := airquality.NewService(stub, airquality.Options{
+		MaxEntries: 100, CurrentTTL: time.Hour, ForecastTTL: time.Hour, GeocodeTTL: time.Hour, NotFoundTTL: time.Hour,
+		StaleFor: time.Hour, FetchTimeout: time.Second, Registerer: prometheus.NewRegistry(),
+	})
+	h := newHarness(t, svc, func(o *Options) { o.MissRateLimitRPS = 0.001; o.MissRateLimitBurst = 2 })
+	from := func(ip, target string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.RemoteAddr = ip + ":1234"
+		rec := httptest.NewRecorder()
+		h.handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	for i, lat := range []string{"10", "11"} {
+		if rec := from("192.0.2.1", "/v1/air-quality/current?lat="+lat+"&lon=0"); rec.Code != 200 {
+			t.Fatalf("miss %d: %d", i, rec.Code)
+		}
+	}
+	rec := from("192.0.2.1", "/v1/air-quality/current?lat=12&lon=0")
+	if p := decodeProblem(t, rec); rec.Code != http.StatusTooManyRequests || p.Code != "rate_limited" || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("third distinct location: status=%d headers=%v", rec.Code, rec.Header())
+	}
+	if stub.calls.Load() != 2 {
+		t.Errorf("vendor calls = %d, want 2: the refused request must not reach the vendor", stub.calls.Load())
+	}
+	if rec := from("192.0.2.1", "/v1/air-quality/current?lat=10&lon=0"); rec.Code != 200 || rec.Header().Get("X-Cache") != "HIT" {
+		t.Errorf("cached locations stay free for an exhausted client: %d %s", rec.Code, rec.Header().Get("X-Cache"))
+	}
+	if rec := from("192.0.2.2", "/v1/air-quality/current?lat=12&lon=0"); rec.Code != 200 {
+		t.Errorf("another client must be unaffected, got %d", rec.Code)
+	}
+	if got := testutil.ToFloat64(counterVec(t, h.reg, "airq_http_rejected_requests_total", map[string]string{"reason": "miss_limited"})); got != 1 {
+		t.Errorf("rejected{miss_limited} = %v", got)
+	}
+}
+
+func TestLimiterKeyGroupsIPv6ByPrefix(t *testing.T) {
+	tests := map[string]string{
+		"192.0.2.7":                 "192.0.2.7",
+		"2001:db8:1:2:aaaa::1":      "2001:db8:1:2::/64",
+		"2001:db8:1:2:bbbb:cccc::9": "2001:db8:1:2::/64",
+		"2001:db8:1:3::1":           "2001:db8:1:3::/64",
+		"::ffff:192.0.2.7":          "::ffff:192.0.2.7",
+		"not-an-ip":                 "not-an-ip",
+	}
+	for in, want := range tests {
+		if got := limiterKey(in); got != want {
+			t.Errorf("limiterKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestWarnsOnceWhenForwardingHeadersAreIgnored(t *testing.T) {
+	h := newHarness(t, okService(), nil) // TrustProxyHeaders is false
+	for range 3 {
+		h.do(t, http.MethodGet, "/v1/air-quality/current?lat=1&lon=1", map[string]string{"X-Forwarded-For": "198.51.100.7"})
+	}
+	if n := strings.Count(h.logs.String(), "HTTP_TRUST_PROXY_HEADERS is false"); n != 1 {
+		t.Errorf("warned %d times, want exactly once a minute:\n%s", n, h.logs)
+	}
+
+	trusted := newHarness(t, okService(), func(o *Options) { o.TrustProxyHeaders = true })
+	trusted.do(t, http.MethodGet, "/v1/air-quality/current?lat=1&lon=1", map[string]string{"X-Forwarded-For": "198.51.100.7"})
+	if strings.Contains(trusted.logs.String(), "HTTP_TRUST_PROXY_HEADERS is false") {
+		t.Error("no warning when the header is trusted")
+	}
 }

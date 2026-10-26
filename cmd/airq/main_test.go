@@ -186,7 +186,8 @@ func TestServeEndToEnd(t *testing.T) {
 }
 
 func TestServeSurvivesVendorOutage(t *testing.T) {
-	inst := start(t, map[string]string{"CACHE_CURRENT_TTL": "1ms"})
+	// SWR is off: this test is about stale-if-error. Two failed calls open the circuit.
+	inst := start(t, map[string]string{"CACHE_CURRENT_TTL": "1ms", "CACHE_REVALIDATE_WINDOW": "0s", "UPSTREAM_BREAKER_THRESHOLD": "2"})
 	if resp, _ := inst.get(t, "/v1/air-quality/current?lat=10&lon=10"); resp.StatusCode != http.StatusOK {
 		t.Fatalf("warm-up = %d", resp.StatusCode)
 	}

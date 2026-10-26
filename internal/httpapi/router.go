@@ -30,6 +30,10 @@ type Options struct {
 	MaxInFlight    int
 	RateLimitRPS   float64
 	RateLimitBurst int
+	// MissRateLimitRPS/Burst bound how many requests per client may be answered from
+	// anything but a fresh cache entry, i.e. how much vendor quota one client can use.
+	MissRateLimitRPS   float64
+	MissRateLimitBurst int
 	// TrustProxyHeaders trusts X-Forwarded-For and incoming W3C traceparent headers.
 	// Enable it only behind a proxy you control: otherwise clients could spoof their
 	// address, pick trace IDs or force sampling.
@@ -47,10 +51,10 @@ type Options struct {
 // probes and scrapes keep working when the API is saturated.
 func NewHandler(o Options) http.Handler {
 	m := newMetrics(o.Registry)
-	a := &api{svc: o.Service, attribution: o.Attribution, log: o.Logger}
+	a := &api{svc: o.Service, attribution: o.Attribution, log: o.Logger, m: m}
 
 	shed := newLoadShedder(o.MaxInFlight, m)
-	limiter := newClientLimiter(o.RateLimitRPS, o.RateLimitBurst, o.TrustProxyHeaders, m)
+	limiter := newClientLimiter(o.RateLimitRPS, o.RateLimitBurst, o.MissRateLimitRPS, o.MissRateLimitBurst, o.TrustProxyHeaders, o.Logger, m)
 	protect := func(h http.HandlerFunc) http.Handler {
 		return shed.wrap(limiter.wrap(withTimeout(o.RequestTimeout, h)))
 	}

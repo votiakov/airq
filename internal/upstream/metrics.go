@@ -70,7 +70,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 
 var outcomes = []string{
 	"success", string(KindTimeout), string(KindNetwork), string(KindRateLimited), string(KindServer),
-	string(KindClient), string(KindBadResponse), string(KindCircuitOpen), string(KindThrottled), string(KindCanceled),
+	string(KindClient), string(KindRejected), string(KindBadResponse), string(KindCircuitOpen), string(KindThrottled), string(KindCanceled),
 }
 
 func (m *Metrics) init(upstream string) {

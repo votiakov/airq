@@ -9,11 +9,13 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -22,6 +24,7 @@ import (
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/time/rate"
 
+	"github.com/votiakov/airq/internal/airquality"
 	"github.com/votiakov/airq/internal/cache"
 	"github.com/votiakov/airq/internal/telemetry"
 )
@@ -264,44 +267,84 @@ func (s *loadShedder) wrap(next http.Handler) http.Handler {
 	})
 }
 
-// clientLimiter applies a token bucket per client IP. Buckets live in a bounded LRU
-// so a flood of distinct addresses cannot grow memory without limit.
+// clientLimiter applies two token buckets per client: one for every API request, and a
+// much smaller one for requests that cannot be answered from a fresh cache entry and so
+// spend vendor quota. Buckets live in a bounded LRU so a flood of distinct addresses
+// cannot grow memory without limit.
 type clientLimiter struct {
-	limit      rate.Limit
-	burst      int
-	trustProxy bool
-	m          *metrics
+	limit, missLimit rate.Limit
+	burst, missBurst int
+	trustProxy       bool
+	log              *slog.Logger
+	m                *metrics
+	lastProxyWarn    atomic.Int64 // UnixNano of the last "untrusted proxy header" warning
 
 	mu      sync.Mutex
-	buckets *cache.Cache[string, *rate.Limiter]
+	buckets *cache.Cache[string, *clientBuckets]
 }
+
+type clientBuckets struct{ all, misses *rate.Limiter }
 
 const (
 	maxTrackedClients = 10_000
 	clientIdleTTL     = 10 * time.Minute
 )
 
-func newClientLimiter(rps float64, burst int, trustProxy bool, m *metrics) *clientLimiter {
+func newClientLimiter(rps float64, burst int, missRPS float64, missBurst int, trustProxy bool, log *slog.Logger, m *metrics) *clientLimiter {
 	return &clientLimiter{
-		limit: rate.Limit(rps), burst: burst, trustProxy: trustProxy, m: m,
-		buckets: cache.New[string, *rate.Limiter](cache.Options{MaxEntries: maxTrackedClients}),
+		limit: rate.Limit(rps), burst: max(burst, 1), missLimit: rate.Limit(missRPS), missBurst: max(missBurst, 1),
+		trustProxy: trustProxy, log: log, m: m,
+		buckets: cache.New[string, *clientBuckets](cache.Options{MaxEntries: maxTrackedClients}),
 	}
 }
 
-func (l *clientLimiter) bucket(ip string) *rate.Limiter {
+func (l *clientLimiter) bucket(key string) *clientBuckets {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	lim := rate.NewLimiter(l.limit, l.burst)
-	if e, ok := l.buckets.Get(ip); ok {
-		lim = e.Value
+	b := &clientBuckets{all: rate.NewLimiter(l.limit, l.burst), misses: rate.NewLimiter(l.missLimit, l.missBurst)}
+	if e, ok := l.buckets.Get(key); ok {
+		b = e.Value
 	}
-	l.buckets.Set(ip, lim, clientIdleTTL, 0) // refresh idle expiry
-	return lim
+	l.buckets.Set(key, b, clientIdleTTL, 0) // refresh idle expiry
+	return b
+}
+
+// limiterKey groups IPv6 clients by /64: a single subscriber is typically handed a
+// whole /64, so per-address buckets would let one client mint unlimited identities.
+func limiterKey(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || addr.Is4() || addr.Is4In6() {
+		return ip
+	}
+	p, err := addr.Prefix(64)
+	if err != nil {
+		return ip
+	}
+	return p.String()
+}
+
+// warnUntrustedProxy logs, at most once a minute, that forwarding headers are being
+// ignored: behind a load balancer that makes every user share one client address, so
+// one rate-limit bucket.
+func (l *clientLimiter) warnUntrustedProxy(r *http.Request) {
+	if l.trustProxy || r.Header.Get("X-Forwarded-For") == "" {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := l.lastProxyWarn.Load()
+	if now-last < int64(time.Minute) || !l.lastProxyWarn.CompareAndSwap(last, now) {
+		return
+	}
+	l.log.WarnContext(r.Context(), "X-Forwarded-For is present but HTTP_TRUST_PROXY_HEADERS is false: "+
+		"all clients behind the proxy share one rate-limit bucket; set it to true if exactly one trusted proxy fronts this service",
+		slog.String("remote_addr", r.RemoteAddr))
 }
 
 func (l *clientLimiter) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		res := l.bucket(clientIP(r, l.trustProxy)).Reserve()
+		l.warnUntrustedProxy(r)
+		b := l.bucket(limiterKey(clientIP(r, l.trustProxy)))
+		res := b.all.Reserve()
 		if d := res.Delay(); d > 0 {
 			res.Cancel()
 			l.m.rejected.WithLabelValues("rate_limited").Inc()
@@ -309,7 +352,16 @@ func (l *clientLimiter) wrap(next http.Handler) http.Handler {
 			writeProblem(w, r, http.StatusTooManyRequests, "rate_limited", "Too many requests from this client; slow down.")
 			return
 		}
-		next.ServeHTTP(w, r)
+		// The service calls this only when answering needs the vendor.
+		gate := func() (time.Duration, bool) {
+			mres := b.misses.Reserve()
+			if d := mres.Delay(); d > 0 {
+				mres.Cancel()
+				return d, false
+			}
+			return 0, true
+		}
+		next.ServeHTTP(w, r.WithContext(airquality.WithMissGate(r.Context(), gate)))
 	})
 }
 

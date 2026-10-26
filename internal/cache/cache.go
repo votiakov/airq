@@ -101,6 +101,19 @@ func (c *Cache[K, V]) Get(key K) (Entry[V], bool) {
 	return it.entry, true
 }
 
+// Peek returns the entry for key, fresh or stale, without touching recency or
+// metrics. It is for re-checking inside a refresh that already counted its lookup.
+func (c *Cache[K, V]) Peek(key K) (Entry[V], bool) {
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	it, found := c.lru.Peek(key)
+	if !found || !now.Before(it.staleUntil) {
+		return Entry[V]{}, false
+	}
+	return it.entry, true
+}
+
 // Set stores value for ttl, keeping it for an additional staleFor as a fallback.
 func (c *Cache[K, V]) Set(key K, value V, ttl, staleFor time.Duration) Entry[V] {
 	now := c.now()

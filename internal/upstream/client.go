@@ -3,14 +3,15 @@
 // Every call passes through, in order:
 //
 //  1. a circuit breaker (sony/gobreaker) that fails fast while the vendor is known
-//     to be down;
+//     to be down. It sees one outcome per logical call (not per retry), and opens on
+//     consecutive failures or on a high failure ratio within a window;
 //  2. a token-bucket quota guard (x/time/rate) so we never exceed the vendor's rate
 //     limit;
 //  3. a bulkhead (x/sync/semaphore) so a slow vendor cannot exhaust goroutines,
 //     sockets or memory;
-//  4. a per-attempt timeout, a response size cap and strict JSON decoding;
-//  5. retries (cenkalti/backoff) with capped, jittered exponential backoff for
-//     transient failures, honouring Retry-After and never sleeping past the caller's
+//  4. a per-attempt timeout, a response size cap and JSON decoding into typed values;
+//  5. retries (cenkalti/backoff) with capped exponential backoff (randomised ±50%)
+//     for transient failures, honouring a bounded Retry-After and never sleeping past the caller's
 //     deadline.
 //
 // The libraries supply the mechanisms; this package owns the policy: which failures
@@ -97,17 +98,24 @@ type Config struct {
 	MaxAttempts      int
 	RetryBaseDelay   time.Duration // first backoff interval, doubled per retry
 	RetryMaxDelay    time.Duration // cap on a single backoff interval
-	BreakerThreshold int           // consecutive failures that open the circuit
+	BreakerThreshold int           // consecutive failed calls that open the circuit
 	BreakerCooldown  time.Duration
-	RateLimit        rate.Limit
-	RateBurst        int
-	MaxConcurrent    int
-	MaxResponseBytes int64
-	Metrics          *Metrics
-	Recorder         Recorder // optional
-	Logger           *slog.Logger
-	Now              func() time.Time
-	TracerProvider   trace.TracerProvider // defaults to the global provider
+	// BreakerFailureRatio opens the circuit when at least this fraction of calls in
+	// BreakerWindow failed, so a vendor that fails intermittently (never five in a row)
+	// is still detected. Zero disables the ratio trip. It needs BreakerMinCalls calls
+	// in the window to avoid tripping on a handful of unlucky ones.
+	BreakerFailureRatio float64
+	BreakerMinCalls     int
+	BreakerWindow       time.Duration
+	RateLimit           rate.Limit
+	RateBurst           int
+	MaxConcurrent       int
+	MaxResponseBytes    int64
+	Metrics             *Metrics
+	Recorder            Recorder // optional
+	Logger              *slog.Logger
+	Now                 func() time.Time
+	TracerProvider      trace.TracerProvider // defaults to the global provider
 }
 
 // Client is safe for concurrent use.
@@ -162,13 +170,21 @@ func New(cfg Config) (*Client, error) {
 		log:      cfg.Logger.With(slog.String("upstream", cfg.Name)),
 		tracer:   cfg.TracerProvider.Tracer("github.com/votiakov/airq/internal/upstream"),
 	}
-	threshold := uint32(min(cfg.BreakerThreshold, math.MaxUint32)) //nolint:gosec // bounded to [1, MaxUint32]
+	threshold := uint32(min(cfg.BreakerThreshold, math.MaxUint32))       //nolint:gosec // bounded to [1, MaxUint32]
+	minCalls := uint32(min(max(cfg.BreakerMinCalls, 1), math.MaxUint32)) //nolint:gosec // bounded to [1, MaxUint32]
 	c.breaker = gobreaker.NewTwoStepCircuitBreaker[struct{}](gobreaker.Settings{
 		Name:        cfg.Name,
 		MaxRequests: 1, // a single trial request while half-open
 		Timeout:     cfg.BreakerCooldown,
-		ReadyToTrip: func(counts gobreaker.Counts) bool { return counts.ConsecutiveFailures >= threshold },
-		IsExcluded:  excludedFromBreaker,
+		Interval:    cfg.BreakerWindow, // closed-state counters restart every window
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			if counts.ConsecutiveFailures >= threshold {
+				return true
+			}
+			return cfg.BreakerFailureRatio > 0 && counts.Requests >= minCalls &&
+				float64(counts.TotalFailures)/float64(counts.Requests) >= cfg.BreakerFailureRatio
+		},
+		IsExcluded: excludedFromBreaker,
 		OnStateChange: func(_ string, from, to gobreaker.State) {
 			if to == gobreaker.StateOpen {
 				c.openedAt.Store(time.Now().UnixNano())
@@ -182,13 +198,14 @@ func New(cfg Config) (*Client, error) {
 }
 
 // excludedFromBreaker reports failures that are not the vendor's fault: our own bad
-// requests, departed callers and attempts that never left the process.
+// requests, departed callers and calls that never left the process (local quota or
+// bulkhead refusals).
 func excludedFromBreaker(err error) bool {
 	if errors.Is(err, errNotSent) {
 		return true
 	}
 	var uerr *Error
-	return errors.As(err, &uerr) && (uerr.Kind == KindClient || uerr.Kind == KindCanceled)
+	return errors.As(err, &uerr) && (uerr.Kind == KindClient || uerr.Kind == KindCanceled || uerr.Kind == KindThrottled)
 }
 
 // NewHTTPClient returns an http.Client tuned for calling a single API host: bounded
@@ -261,10 +278,22 @@ func (c *Client) getJSON(ctx context.Context, path string, query url.Values, out
 	}
 	target.RawQuery = q.Encode()
 
+	// The breaker sees one outcome per logical call, not one per attempt: retries are
+	// our own amplification of a single failure, and counting them would let one slow
+	// call trip the circuit and then be answered with "circuit open" mid-retry.
+	done, berr := c.breaker.Allow() // ErrOpenState, or ErrTooManyRequests while a half-open trial runs
+	if berr != nil {
+		c.cfg.Metrics.attempts.WithLabelValues(c.cfg.Name, string(KindCircuitOpen)).Inc()
+		return &Error{Upstream: c.cfg.Name, Kind: KindCircuitOpen, RetryAfter: c.circuitRetryAfter(), Err: berr}
+	}
+	var lastVendorErr *Error // the last failure that is the vendor's doing
 	attempt := 0
 	op := func() (struct{}, error) {
 		attempt++
 		err := c.attempt(ctx, attempt, target, out)
+		if err != nil && !excludedFromBreaker(err) {
+			lastVendorErr = err
+		}
 		switch {
 		case err == nil:
 			return struct{}{}, nil
@@ -289,13 +318,21 @@ func (c *Client) getJSON(ctx context.Context, path string, query url.Values, out
 		backoff.WithNotify(func(error, time.Duration) { c.cfg.Metrics.retries.WithLabelValues(c.cfg.Name).Inc() }),
 	)
 	if err == nil {
+		done(nil)
 		return nil
 	}
 	var uerr *Error
-	if errors.As(err, &uerr) {
-		return uerr
+	if !errors.As(err, &uerr) {
+		uerr = c.contextError(ctx.Err()) // cancelled while backing off
 	}
-	return c.contextError(ctx.Err()) // cancelled while backing off
+	// Report the vendor's last real failure to the breaker even when the call ended
+	// because the caller left or the local quota ran out while retrying.
+	if excludedFromBreaker(uerr) && lastVendorErr != nil {
+		done(lastVendorErr)
+	} else {
+		done(uerr)
+	}
+	return uerr
 }
 
 // retryBudget bounds the retry loop so a backoff sleep only starts when an attempt
@@ -311,14 +348,8 @@ func retryBudget(ctx context.Context) time.Duration {
 
 func (c *Client) attempt(ctx context.Context, attempt int, target *url.URL, out any) *Error {
 	name := c.cfg.Name
-	done, err := c.breaker.Allow() // ErrOpenState, or ErrTooManyRequests while a half-open trial runs
-	if err != nil {
-		c.cfg.Metrics.attempts.WithLabelValues(name, string(KindCircuitOpen)).Inc()
-		return &Error{Upstream: name, Kind: KindCircuitOpen, RetryAfter: c.circuitRetryAfter(), Err: err}
-	}
 
 	if uerr := c.admit(ctx); uerr != nil {
-		done(errNotSent)
 		c.cfg.Metrics.attempts.WithLabelValues(name, string(uerr.Kind)).Inc()
 		return uerr
 	}
@@ -345,9 +376,6 @@ func (c *Client) attempt(ctx context.Context, attempt int, target *url.URL, out 
 	outcome := "success"
 	if uerr != nil {
 		outcome = string(uerr.Kind)
-		done(uerr)
-	} else {
-		done(nil)
 	}
 
 	c.cfg.Metrics.attempts.WithLabelValues(name, outcome).Inc()
@@ -464,9 +492,15 @@ func (c *Client) do(ctx context.Context, target *url.URL, out any) (int, []byte,
 	case resp.StatusCode == http.StatusTooManyRequests:
 		ra, _ := parseRetryAfter(resp.Header.Get("Retry-After"), c.cfg.Now())
 		return resp.StatusCode, body, &Error{Upstream: name, Kind: KindRateLimited, StatusCode: resp.StatusCode, RetryAfter: ra}
-	case resp.StatusCode >= 500:
+	case resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooEarly:
 		ra, _ := parseRetryAfter(resp.Header.Get("Retry-After"), c.cfg.Now())
 		return resp.StatusCode, body, &Error{Upstream: name, Kind: KindServer, StatusCode: resp.StatusCode, RetryAfter: ra}
+	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden,
+		resp.StatusCode == http.StatusNotFound, resp.StatusCode == http.StatusGone:
+		// The vendor is refusing us (revoked key, exhausted plan, retired endpoint), not
+		// complaining about one malformed request. Retrying cannot help, but the breaker
+		// must see it, stale data may cover for it, and an alert must name it.
+		return resp.StatusCode, body, &Error{Upstream: name, Kind: KindRejected, StatusCode: resp.StatusCode, Reason: vendorReason(body)}
 	case resp.StatusCode >= 400:
 		return resp.StatusCode, body, &Error{Upstream: name, Kind: KindClient, StatusCode: resp.StatusCode, Reason: vendorReason(body)}
 	default:

@@ -5,6 +5,7 @@ package openmeteo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -56,8 +57,15 @@ func (c *Client) Current(ctx context.Context, coords airquality.Coordinates) (ai
 	if resp.Current == nil {
 		return airquality.Current{}, contractError("air_quality", "response has no current block")
 	}
+	coords, err := resp.coordinates()
+	if err != nil {
+		return airquality.Current{}, contractError("air_quality", err.Error())
+	}
+	if resp.Current.Time == nil || *resp.Current.Time < minPlausibleTime {
+		return airquality.Current{}, contractError("air_quality", "current block has no plausible timestamp")
+	}
 	return airquality.Current{
-		Coordinates: airquality.Coordinates{Latitude: resp.Latitude, Longitude: resp.Longitude},
+		Coordinates: coords,
 		Elevation:   resp.Elevation,
 		Units:       units(resp.CurrentUnits),
 		Current:     resp.Current.reading(),
@@ -77,12 +85,19 @@ func (c *Client) Forecast(ctx context.Context, coords airquality.Coordinates, ho
 	if resp.Hourly == nil {
 		return airquality.Forecast{}, contractError("air_quality", "response has no hourly block")
 	}
+	coords, err := resp.coordinates()
+	if err != nil {
+		return airquality.Forecast{}, contractError("air_quality", err.Error())
+	}
 	readings, err := resp.Hourly.readings()
 	if err != nil {
 		return airquality.Forecast{}, contractError("air_quality", err.Error())
 	}
+	if len(readings) == 0 {
+		return airquality.Forecast{}, contractError("air_quality", "hourly block is empty")
+	}
 	return airquality.Forecast{
-		Coordinates: airquality.Coordinates{Latitude: resp.Latitude, Longitude: resp.Longitude},
+		Coordinates: coords,
 		Elevation:   resp.Elevation,
 		Units:       units(resp.HourlyUnits),
 		Hourly:      readings,
@@ -107,6 +122,11 @@ func (c *Client) Geocode(ctx context.Context, name, countryCode string) ([]airqu
 	}
 	locs := make([]airquality.Location, 0, len(resp.Results))
 	for _, r := range resp.Results {
+		coords, err := validCoordinates(r.Latitude, r.Longitude)
+		if err != nil || r.Name == "" {
+			// A hit without usable coordinates would silently send queries to (0,0).
+			return nil, contractError("geocoding", "result has no usable name and coordinates")
+		}
 		locs = append(locs, airquality.Location{
 			Name:        r.Name,
 			Admin1:      r.Admin1,
@@ -114,7 +134,7 @@ func (c *Client) Geocode(ctx context.Context, name, countryCode string) ([]airqu
 			CountryCode: r.CountryCode,
 			Timezone:    r.Timezone,
 			Population:  r.Population,
-			Coordinates: airquality.Coordinates{Latitude: r.Latitude, Longitude: r.Longitude},
+			Coordinates: coords,
 		})
 	}
 	return locs, nil
@@ -147,9 +167,26 @@ func units(in map[string]string) map[string]string {
 	return out
 }
 
+// minPlausibleTime is the start of the CAMS archive Open-Meteo serves (2013-01-01
+// UTC). Anything earlier, notably the zero value of a missing field, is not a reading.
+const minPlausibleTime = 1356998400
+
+// validCoordinates rejects missing or out-of-range coordinates. Pointers distinguish
+// "absent" from a real 0.
+func validCoordinates(lat, lon *float64) (airquality.Coordinates, error) {
+	if lat == nil || lon == nil || *lat < -90 || *lat > 90 || *lon < -180 || *lon > 180 {
+		return airquality.Coordinates{}, errors.New("coordinates are missing or out of range")
+	}
+	return airquality.Coordinates{Latitude: *lat, Longitude: *lon}, nil
+}
+
+func (r *aqResponse) coordinates() (airquality.Coordinates, error) {
+	return validCoordinates(r.Latitude, r.Longitude)
+}
+
 type aqResponse struct {
-	Latitude     float64           `json:"latitude"`
-	Longitude    float64           `json:"longitude"`
+	Latitude     *float64          `json:"latitude"`
+	Longitude    *float64          `json:"longitude"`
 	Elevation    float64           `json:"elevation"`
 	CurrentUnits map[string]string `json:"current_units"`
 	Current      *aqPoint          `json:"current"`
@@ -158,7 +195,7 @@ type aqResponse struct {
 }
 
 type aqPoint struct {
-	Time            int64    `json:"time"`
+	Time            *int64   `json:"time"`
 	EuropeanAQI     *float64 `json:"european_aqi"`
 	USAQI           *float64 `json:"us_aqi"`
 	PM10            *float64 `json:"pm10"`
@@ -174,7 +211,7 @@ type aqPoint struct {
 
 func (p aqPoint) reading() airquality.Reading {
 	return airquality.Reading{
-		Time:        time.Unix(p.Time, 0).UTC(),
+		Time:        time.Unix(deref(p.Time), 0).UTC(),
 		EuropeanAQI: airquality.NewEuropeanAQI(p.EuropeanAQI),
 		USAQI:       airquality.NewUSAQI(p.USAQI),
 		UVIndex:     p.UVIndex,
@@ -209,6 +246,11 @@ type aqSeries struct {
 
 func (s *aqSeries) readings() ([]airquality.Reading, error) {
 	n := len(s.Time)
+	for i, t := range s.Time {
+		if t < minPlausibleTime || (i > 0 && t <= s.Time[i-1]) {
+			return nil, fmt.Errorf("hourly timestamp %d (index %d) is implausible or out of order", t, i)
+		}
+	}
 	columns := map[string][]*float64{
 		"european_aqi": s.EuropeanAQI, "us_aqi": s.USAQI, "pm10": s.PM10, "pm2_5": s.PM25,
 		"carbon_monoxide": s.CarbonMonoxide, "nitrogen_dioxide": s.NitrogenDioxide,
@@ -230,7 +272,7 @@ func (s *aqSeries) readings() ([]airquality.Reading, error) {
 	out := make([]airquality.Reading, n)
 	for i := range n {
 		out[i] = aqPoint{
-			Time:            s.Time[i],
+			Time:            &s.Time[i],
 			EuropeanAQI:     at(s.EuropeanAQI, i),
 			USAQI:           at(s.USAQI, i),
 			PM10:            at(s.PM10, i),
@@ -247,15 +289,22 @@ func (s *aqSeries) readings() ([]airquality.Reading, error) {
 	return out, nil
 }
 
+func deref(p *int64) int64 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
 type geoResponse struct {
 	Results []struct {
-		Name        string  `json:"name"`
-		Latitude    float64 `json:"latitude"`
-		Longitude   float64 `json:"longitude"`
-		CountryCode string  `json:"country_code"`
-		Country     string  `json:"country"`
-		Admin1      string  `json:"admin1"`
-		Timezone    string  `json:"timezone"`
-		Population  int     `json:"population"`
+		Name        string   `json:"name"`
+		Latitude    *float64 `json:"latitude"`
+		Longitude   *float64 `json:"longitude"`
+		CountryCode string   `json:"country_code"`
+		Country     string   `json:"country"`
+		Admin1      string   `json:"admin1"`
+		Timezone    string   `json:"timezone"`
+		Population  int      `json:"population"`
 	} `json:"results"`
 }

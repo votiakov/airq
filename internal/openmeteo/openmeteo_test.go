@@ -119,7 +119,35 @@ func TestContractViolations(t *testing.T) {
 			_, err := c.Forecast(context.Background(), airquality.Coordinates{}, 1)
 			return err
 		}},
-		"ragged hourly": {`{"hourly":{"time":[1,2],"pm10":[1]}}`, func(c *Client) error {
+		"current block empty": {`{"latitude":1,"longitude":1,"current":{}}`, func(c *Client) error {
+			_, err := c.Current(context.Background(), airquality.Coordinates{})
+			return err
+		}},
+		"current without coordinates": {`{"current":{"time":1793030400}}`, func(c *Client) error {
+			_, err := c.Current(context.Background(), airquality.Coordinates{})
+			return err
+		}},
+		"current coordinates out of range": {`{"latitude":91,"longitude":1,"current":{"time":1793030400}}`, func(c *Client) error {
+			_, err := c.Current(context.Background(), airquality.Coordinates{})
+			return err
+		}},
+		"current with 1970 timestamp": {`{"latitude":1,"longitude":1,"current":{"time":0}}`, func(c *Client) error {
+			_, err := c.Current(context.Background(), airquality.Coordinates{})
+			return err
+		}},
+		"hourly empty": {`{"latitude":1,"longitude":1,"hourly":{"time":[]}}`, func(c *Client) error {
+			_, err := c.Forecast(context.Background(), airquality.Coordinates{}, 1)
+			return err
+		}},
+		"hourly out of order": {`{"latitude":1,"longitude":1,"hourly":{"time":[1793034000,1793030400]}}`, func(c *Client) error {
+			_, err := c.Forecast(context.Background(), airquality.Coordinates{}, 2)
+			return err
+		}},
+		"geocode result without coordinates": {`{"results":[{"name":"Nowhere"}]}`, func(c *Client) error {
+			_, err := c.Geocode(context.Background(), "nowhere", "")
+			return err
+		}},
+		"ragged hourly": {`{"latitude":1,"longitude":1,"hourly":{"time":[1793030400,1793034000],"pm10":[1]}}`, func(c *Client) error {
 			_, err := c.Forecast(context.Background(), airquality.Coordinates{}, 2)
 			return err
 		}},

@@ -495,3 +495,136 @@ func TestNewValidatesConfig(t *testing.T) {
 		t.Error("expected missing metrics error")
 	}
 }
+
+func TestVendorRefusalsAreUnavailableCountAgainstTheBreakerAndAreNotRetried(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusGone} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			f := newFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}, func(c *Config) { c.BreakerThreshold = 2 })
+
+			err := f.client.GetJSON(context.Background(), "/", nil, &struct{}{})
+			var uerr *Error
+			if !errors.As(err, &uerr) || uerr.Kind != KindRejected || uerr.StatusCode != status {
+				t.Fatalf("err = %v, want rejected (HTTP %d)", err, status)
+			}
+			if !uerr.Unavailable() {
+				t.Error("a vendor refusal must allow stale fallback: the cache can cover for it")
+			}
+			if f.hits.Load() != 1 {
+				t.Errorf("hits = %d, a refusal must not be retried", f.hits.Load())
+			}
+
+			_ = f.client.GetJSON(context.Background(), "/", nil, &struct{}{})
+			if f.client.breaker.State() != gobreaker.StateOpen {
+				t.Errorf("breaker = %s, want open: every call is spending quota on a refusal", f.client.breaker.State())
+			}
+			if got := f.count(f.metrics.calls, "test", "rejected"); got != 2 {
+				t.Errorf("calls{rejected} = %v", got)
+			}
+		})
+	}
+}
+
+func TestMalformedRequestsStayClientErrors(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnprocessableEntity} {
+		f := newFixture(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }, nil)
+		err := f.client.GetJSON(context.Background(), "/", nil, &struct{}{})
+		if kindOf(t, err) != KindClient {
+			t.Errorf("HTTP %d: kind = %v, want client_error", status, kindOf(t, err))
+		}
+	}
+}
+
+func TestRequestTimeoutAndTooEarlyAreRetriedAsTransient(t *testing.T) {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooEarly} {
+		f := newFixture(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }, nil)
+		err := f.client.GetJSON(context.Background(), "/", nil, &struct{}{})
+		if kindOf(t, err) != KindServer || f.hits.Load() != 3 {
+			t.Errorf("HTTP %d: kind = %v hits = %d, want server_error after 3 attempts", status, kindOf(t, err), f.hits.Load())
+		}
+	}
+}
+
+func TestHugeRetryAfterIsCapped(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "86400")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}, func(c *Config) { c.MaxAttempts = 1 })
+	var uerr *Error
+	err := f.client.GetJSON(context.Background(), "/", nil, &struct{}{})
+	if !errors.As(err, &uerr) || uerr.RetryAfter != MaxRetryAfter {
+		t.Fatalf("RetryAfter = %v, want it capped at %v (err %v)", uerr.RetryAfter, MaxRetryAfter, err)
+	}
+}
+
+func TestBreakerCountsLogicalCallsNotRetries(t *testing.T) {
+	f := newFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}, func(c *Config) { c.BreakerThreshold = 2 }) // MaxAttempts is 3
+
+	// One call makes three failing attempts. That is one failure, not three: the caller
+	// must see the vendor's real error, not "circuit open" from its own retries.
+	err := f.client.GetJSON(context.Background(), "/", nil, &struct{}{})
+	if kindOf(t, err) != KindServer || f.hits.Load() != 3 {
+		t.Fatalf("kind = %v hits = %d, want server_error after all 3 attempts", kindOf(t, err), f.hits.Load())
+	}
+	if f.client.breaker.State() != gobreaker.StateClosed {
+		t.Fatalf("breaker = %s after one failed call, want closed", f.client.breaker.State())
+	}
+	if kindOf(t, f.client.GetJSON(context.Background(), "/", nil, &struct{}{})) != KindServer {
+		t.Fatal("second call should still reach the vendor and report its error")
+	}
+	if f.client.breaker.State() != gobreaker.StateOpen {
+		t.Errorf("breaker = %s after two failed calls, want open", f.client.breaker.State())
+	}
+}
+
+func TestBreakerOpensOnFailureRatioWithoutConsecutiveFailures(t *testing.T) {
+	var n atomic.Int32
+	f := newFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		if n.Add(1)%2 == 0 { // every other call fails: never two in a row
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}, func(c *Config) {
+		c.MaxAttempts = 1
+		c.BreakerThreshold = 5
+		c.BreakerFailureRatio = 0.5
+		c.BreakerMinCalls = 10
+		c.BreakerWindow = time.Minute
+	})
+	for i := range 12 {
+		_ = f.client.GetJSON(context.Background(), "/", nil, &struct{}{})
+		if f.client.breaker.State() == gobreaker.StateOpen {
+			if i < 9 {
+				t.Fatalf("opened after %d calls, before the %d-call minimum", i+1, 10)
+			}
+			return
+		}
+	}
+	t.Fatalf("breaker = %s, want open: half of the calls failed", f.client.breaker.State())
+}
+
+func TestLocalThrottlingAfterAVendorFailureStillCountsTheFailure(t *testing.T) {
+	var calls atomic.Int32
+	f := newFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}, func(c *Config) {
+		c.BreakerThreshold = 1
+		c.RateLimit = rate.Every(time.Hour) // one token, then throttled
+		c.RateBurst = 1
+		c.RetryBaseDelay = time.Millisecond
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	err := f.client.GetJSON(ctx, "/", nil, &struct{}{})
+	if kindOf(t, err) != KindThrottled {
+		t.Fatalf("kind = %v, want throttled on the second attempt", kindOf(t, err))
+	}
+	if f.client.breaker.State() != gobreaker.StateOpen {
+		t.Errorf("breaker = %s: the attempt that reached the vendor failed and must count", f.client.breaker.State())
+	}
+}

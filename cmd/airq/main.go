@@ -184,7 +184,9 @@ func serve(ctx context.Context, getenv func(string) string, stdout io.Writer, on
 			AttemptTimeout: cfg.Upstream.AttemptTimeout, MaxAttempts: cfg.Upstream.MaxAttempts,
 			RetryBaseDelay: cfg.Upstream.RetryBaseDelay, RetryMaxDelay: cfg.Upstream.RetryMaxDelay,
 			BreakerThreshold: cfg.Upstream.BreakerThreshold, BreakerCooldown: cfg.Upstream.BreakerCooldown,
-			RateLimit: rate.Limit(cfg.Upstream.RateLimitRPS), RateBurst: cfg.Upstream.RateLimitBurst,
+			BreakerFailureRatio: cfg.Upstream.BreakerFailureRatio, BreakerMinCalls: cfg.Upstream.BreakerMinCalls,
+			BreakerWindow: cfg.Upstream.BreakerWindow,
+			RateLimit:     rate.Limit(cfg.Upstream.RateLimitRPS), RateBurst: cfg.Upstream.RateLimitBurst,
 			MaxConcurrent: cfg.Upstream.MaxConcurrent, MaxResponseBytes: cfg.Upstream.MaxResponseBytes,
 			Metrics: upstreamMetrics, Recorder: recorder, Logger: logger,
 		})
@@ -210,7 +212,8 @@ func serve(ctx context.Context, getenv func(string) string, stdout io.Writer, on
 	svc := airquality.NewService(openmeteo.New(aqClient, geoClient), airquality.Options{
 		MaxEntries: cfg.Cache.MaxEntries, CurrentTTL: cfg.Cache.CurrentTTL, ForecastTTL: cfg.Cache.ForecastTTL,
 		GeocodeTTL: cfg.Cache.GeocodeTTL, NotFoundTTL: cfg.Cache.NotFoundTTL, StaleFor: cfg.Cache.StaleFor,
-		FetchTimeout: cfg.HTTP.RequestTimeout, Registerer: reg, Logger: logger,
+		RevalidateWindow: cfg.Cache.RevalidateWindow,
+		FetchTimeout:     cfg.HTTP.RequestTimeout, Registerer: reg, Logger: logger,
 	})
 	checker := health.NewChecker(reg, logger, cfg.Health.CacheTTL, checks...)
 	initial := checker.Report(ctx)
@@ -222,6 +225,7 @@ func serve(ctx context.Context, getenv func(string) string, stdout io.Writer, on
 			Service: svc, Health: checker, Registry: reg, Logger: logger, Attribution: openmeteo.Attribution,
 			RequestTimeout: cfg.HTTP.RequestTimeout, MaxInFlight: cfg.HTTP.MaxInFlight,
 			RateLimitRPS: cfg.HTTP.RateLimitRPS, RateLimitBurst: cfg.HTTP.RateLimitBurst,
+			MissRateLimitRPS: cfg.HTTP.MissRateLimitRPS, MissRateLimitBurst: cfg.HTTP.MissRateLimitBurst,
 			TrustProxyHeaders: cfg.HTTP.TrustProxyHeaders,
 		}),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,

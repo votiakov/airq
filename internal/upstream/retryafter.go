@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// MaxRetryAfter caps any Retry-After hint taken from the vendor. Whatever the vendor
+// asks for, we never sleep, or tell our own clients to wait, longer than this.
+const MaxRetryAfter = 2 * time.Minute
+
 // parseRetryAfter interprets a Retry-After header value, which is either a number of
 // seconds or an HTTP date. It returns false when the header is absent or malformed.
 func parseRetryAfter(v string, now time.Time) (time.Duration, bool) {
@@ -18,10 +22,10 @@ func parseRetryAfter(v string, now time.Time) (time.Duration, bool) {
 		if secs < 0 {
 			return 0, false
 		}
-		return time.Duration(secs) * time.Second, true
+		return min(time.Duration(min(secs, int(MaxRetryAfter/time.Second)))*time.Second, MaxRetryAfter), true
 	}
 	if t, err := http.ParseTime(v); err == nil {
-		return max(t.Sub(now), 0), true
+		return min(max(t.Sub(now), 0), MaxRetryAfter), true
 	}
 	return 0, false
 }

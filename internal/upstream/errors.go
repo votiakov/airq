@@ -15,7 +15,8 @@ const (
 	KindNetwork     Kind = "network"      // DNS, connect, reset, truncated body...
 	KindRateLimited Kind = "rate_limited" // vendor answered 429
 	KindServer      Kind = "server_error" // vendor answered 5xx
-	KindClient      Kind = "client_error" // vendor answered 4xx: our request was invalid
+	KindClient      Kind = "client_error" // vendor answered 400/422/...: our request was invalid
+	KindRejected    Kind = "rejected"     // vendor answered 401/403/404/410: it refuses us, not this one request
 	KindBadResponse Kind = "bad_response" // unexpected status, oversized or undecodable body
 	KindCircuitOpen Kind = "circuit_open" // breaker is failing fast
 	KindThrottled   Kind = "throttled"    // local quota guard or bulkhead could not admit in time
@@ -54,7 +55,7 @@ func (e *Error) Unwrap() error { return e.Err }
 // fall back to stale cached data.
 func (e *Error) Unavailable() bool {
 	switch e.Kind {
-	case KindTimeout, KindNetwork, KindRateLimited, KindServer, KindBadResponse, KindCircuitOpen, KindThrottled:
+	case KindTimeout, KindNetwork, KindRateLimited, KindServer, KindBadResponse, KindRejected, KindCircuitOpen, KindThrottled:
 		return true
 	case KindClient, KindCanceled:
 		return false
@@ -68,7 +69,7 @@ func (e *Error) retryable() bool {
 	switch e.Kind {
 	case KindTimeout, KindNetwork, KindRateLimited, KindServer:
 		return true
-	case KindBadResponse, KindClient, KindCircuitOpen, KindThrottled, KindCanceled:
+	case KindBadResponse, KindClient, KindRejected, KindCircuitOpen, KindThrottled, KindCanceled:
 		return false
 	default:
 		return false
