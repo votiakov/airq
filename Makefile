@@ -11,6 +11,10 @@ TEST_PG_IMAGE := postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f
 TEST_PG_PORT  ?= 55432
 MOCK_URL      ?= http://localhost:$(or $(MOCK_PORT),8090)
 
+# Build `go run` tools with the module's toolchain: otherwise Go picks the tool's own
+# minimum version, which cannot analyse code that needs a newer Go.
+GO_TOOLCHAIN := $(shell go env GOVERSION)
+
 # Stamp images built by compose with the git revision.
 export AIRQ_VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 export AIRQ_REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
@@ -71,11 +75,11 @@ cover: ## Write an HTML coverage report to coverage.html
 
 .PHONY: lint
 lint: ## Run golangci-lint (same version as CI)
-	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run ./...
+	GOTOOLCHAIN=$(GO_TOOLCHAIN) go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run ./...
 
 .PHONY: vuln
 vuln: ## Report known vulnerabilities reachable from the code
-	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+	GOTOOLCHAIN=$(GO_TOOLCHAIN) go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 .PHONY: rules-test
 rules-test: ## Validate Prometheus config and run the alert unit tests
