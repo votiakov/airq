@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 type unavailableErr struct{}
@@ -154,7 +153,7 @@ func TestStaleIfError(t *testing.T) {
 	if err != nil || r.Status != CacheStale || r.TTL != 0 || r.Age != 2*time.Minute {
 		t.Fatalf("expected stale fallback, got %+v %v", r, err)
 	}
-	if got := testutil.ToFloat64(counter(t, reg, "airq_cache_stale_served_total", "current")); got != 1 {
+	if got := counterValue(t, reg, "airq_cache_stale_served_total", "current"); got != 1 {
 		t.Errorf("stale_served = %v", got)
 	}
 
@@ -188,7 +187,7 @@ func TestCoalescesConcurrentMisses(t *testing.T) {
 	if p.calls.Load() != 1 {
 		t.Errorf("provider calls = %d, want 1 (coalesced)", p.calls.Load())
 	}
-	if got := testutil.ToFloat64(counter(t, reg, "airq_cache_coalesced_requests_total", "current")); got < 1 {
+	if got := counterValue(t, reg, "airq_cache_coalesced_requests_total", "current"); got < 1 {
 		t.Errorf("coalesced counter = %v", got)
 	}
 }
@@ -328,7 +327,7 @@ func TestAQICategories(t *testing.T) {
 	}
 }
 
-func counter(t *testing.T, reg *prometheus.Registry, name, cacheName string) prometheus.Collector {
+func counterValue(t *testing.T, reg *prometheus.Registry, name, cacheName string) float64 {
 	t.Helper()
 	mfs, err := reg.Gather()
 	if err != nil {
@@ -341,13 +340,11 @@ func counter(t *testing.T, reg *prometheus.Registry, name, cacheName string) pro
 		for _, m := range mf.GetMetric() {
 			for _, l := range m.GetLabel() {
 				if l.GetName() == "cache" && l.GetValue() == cacheName {
-					c := prometheus.NewCounter(prometheus.CounterOpts{Name: "copy", Help: "copy"})
-					c.Add(m.GetCounter().GetValue())
-					return c
+					return m.GetCounter().GetValue()
 				}
 			}
 		}
 	}
 	t.Fatalf("metric %s{cache=%q} not found", name, cacheName)
-	return nil
+	return 0
 }
