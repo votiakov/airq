@@ -1,0 +1,114 @@
+# Unit tests for the alerting rules: promtool test rules deploy/prometheus/tests/*.test.yml
+rule_files:
+  - ../rules/airq.rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  - name: target down pages after a minute
+    interval: 15s
+    input_series:
+      - series: 'up{job="airq",instance="airq:8080"}'
+        values: '1 1 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: AirqTargetDown
+        exp_alerts: []
+      - eval_time: 105s
+        alertname: AirqTargetDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: airq, instance: "airq:8080"}
+            exp_annotations:
+              summary: airq instance airq:8080 is not being scraped
+              description: Prometheus cannot scrape the service; it is down or unreachable.
+              runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqtargetdown
+
+  - name: fast burn needs both windows
+    interval: 1m
+    input_series:
+      # 100 req/s, 10% failing from the start: both the 5m and 1h ratios exceed 7.2%.
+      - series: 'airq_http_requests_total{route="/v1/air-quality/{location}",code="200"}'
+        values: '0+5400x70'
+      - series: 'airq_http_requests_total{route="/v1/air-quality/{location}",code="503"}'
+        values: '0+600x70'
+      # Probes are excluded from the SLI however badly they fail.
+      - series: 'airq_http_requests_total{route="/readyz",code="503"}'
+        values: '0+100000x70'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AirqErrorBudgetBurnFast
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: API is burning its error budget 14x too fast (2% of the 30-day budget per hour)
+              description: "10% of API requests are failing with 5xx."
+              runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqerrorbudgetburn
+
+  - name: healthy traffic does not burn budget
+    interval: 1m
+    input_series:
+      - series: 'airq_http_requests_total{route="/v1/air-quality/current",code="200"}'
+        values: '0+6000x70'
+      - series: 'airq_http_requests_total{route="/v1/air-quality/current",code="500"}'
+        values: '0+1x70'
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: AirqErrorBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: AirqErrorBudgetBurnSlow
+        exp_alerts: []
+
+  - name: open circuit alerts per upstream
+    interval: 15s
+    input_series:
+      - series: 'airq_upstream_circuit_state{upstream="air_quality",instance="airq:8080"}'
+        values: '0 2 2 2 2 2 2 2 2'
+      - series: 'airq_upstream_circuit_state{upstream="geocoding",instance="airq:8080"}'
+        values: '0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: AirqUpstreamCircuitOpen
+        exp_alerts:
+          - exp_labels: {severity: warning, upstream: air_quality}
+            exp_annotations:
+              summary: Circuit breaker for air_quality is open
+              description: The vendor is failing; cached data is served where available and new locations fail with 503.
+              runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqupstreamcircuitopen
+
+  - name: recorder losing records
+    interval: 1m
+    input_series:
+      - series: 'airq_recorder_records_total{result="written"}'
+        values: '0+100x20'
+      - series: 'airq_recorder_records_total{result="dropped"}'
+        values: '0 0 0 5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80 85 90'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: AirqRecorderLosingRecords
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Upstream responses are not being persisted
+              description: The recorder queue is full or inserts are failing; audit rows are being lost.
+              runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqrecorderlosingrecords
+
+  - name: soft database failure warns but stays quiet when healthy
+    interval: 30s
+    input_series:
+      - series: 'airq_health_check_up{check="database",critical="false",instance="airq:8080"}'
+        values: '1 0 0 0 0 0 0 0'
+      - series: 'airq_health_check_up{check="migrations",critical="false",instance="airq:8080"}'
+        values: '1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: AirqDatabaseDown
+        exp_alerts:
+          - exp_labels: {severity: warning, check: database, critical: "false", instance: "airq:8080"}
+            exp_annotations:
+              summary: PostgreSQL is unreachable from airq:8080
+              description: The API keeps serving; the upstream response audit log is not being written.
+              runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqdatabasedown
+      - eval_time: 3m
+        alertname: AirqMigrationsPending
+        exp_alerts: []

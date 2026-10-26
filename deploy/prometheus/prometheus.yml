@@ -1,0 +1,16 @@
+# Local Prometheus for the compose stack. Exemplar storage is enabled on the command
+# line (--enable-feature=exemplar-storage) so latency histograms link to Jaeger traces.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: airq
+    static_configs:
+      - targets: ["airq:8080"]
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

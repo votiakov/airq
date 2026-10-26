@@ -1,0 +1,166 @@
+# SLIs, SLO burn-rate alerts and symptom alerts for airq. Runbooks live in
+# docs/OPERATIONS.md; every alert links to its section.
+#
+# SLOs (30-day window, API routes /v1/* only; probes and scrapes excluded):
+#   availability  99.5% of requests do not return 5xx (error budget 0.5%)
+#   latency       99% of requests complete in under 1s
+groups:
+  - name: airq-sli
+    interval: 30s
+    rules:
+      - record: airq:api_requests:rate5m
+        expr: sum(rate(airq_http_requests_total{route=~"/v1/.*"}[5m]))
+      - record: airq:api_request_errors:ratio_rate5m
+        expr: |
+          sum(rate(airq_http_requests_total{route=~"/v1/.*",code=~"5.."}[5m]))
+          / sum(rate(airq_http_requests_total{route=~"/v1/.*"}[5m]))
+      - record: airq:api_request_errors:ratio_rate30m
+        expr: |
+          sum(rate(airq_http_requests_total{route=~"/v1/.*",code=~"5.."}[30m]))
+          / sum(rate(airq_http_requests_total{route=~"/v1/.*"}[30m]))
+      - record: airq:api_request_errors:ratio_rate1h
+        expr: |
+          sum(rate(airq_http_requests_total{route=~"/v1/.*",code=~"5.."}[1h]))
+          / sum(rate(airq_http_requests_total{route=~"/v1/.*"}[1h]))
+      - record: airq:api_request_errors:ratio_rate6h
+        expr: |
+          sum(rate(airq_http_requests_total{route=~"/v1/.*",code=~"5.."}[6h]))
+          / sum(rate(airq_http_requests_total{route=~"/v1/.*"}[6h]))
+      - record: airq:api_request_latency_under_1s:ratio_rate5m
+        expr: |
+          sum(rate(airq_http_request_duration_seconds_bucket{route=~"/v1/.*",le="1"}[5m]))
+          / sum(rate(airq_http_request_duration_seconds_count{route=~"/v1/.*"}[5m]))
+      - record: route:airq_http_request_duration_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (le, route) (rate(airq_http_request_duration_seconds_bucket{route=~"/v1/.*"}[5m])))
+      - record: cache:airq_cache_lookups:hit_ratio_5m
+        expr: |
+          sum by (cache) (rate(airq_cache_lookups_total{result="hit"}[5m]))
+          / sum by (cache) (rate(airq_cache_lookups_total[5m]))
+      - record: upstream:airq_upstream_calls:error_ratio_5m
+        expr: |
+          sum by (upstream) (rate(airq_upstream_calls_total{outcome!="success"}[5m]))
+          / sum by (upstream) (rate(airq_upstream_calls_total[5m]))
+
+  - name: airq-alerts
+    rules:
+      - alert: AirqTargetDown
+        expr: up{job="airq"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: airq instance {{ $labels.instance }} is not being scraped
+          description: Prometheus cannot scrape the service; it is down or unreachable.
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqtargetdown
+
+      # Multi-window, multi-burn-rate alerts (Google SRE workbook, chapter 5).
+      - alert: AirqErrorBudgetBurnFast
+        expr: |
+          airq:api_request_errors:ratio_rate5m > (14.4 * 0.005)
+          and airq:api_request_errors:ratio_rate1h > (14.4 * 0.005)
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: API is burning its error budget 14x too fast (2% of the 30-day budget per hour)
+          description: "{{ $value | humanizePercentage }} of API requests are failing with 5xx."
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqerrorbudgetburn
+      - alert: AirqErrorBudgetBurnSlow
+        expr: |
+          airq:api_request_errors:ratio_rate30m > (6 * 0.005)
+          and airq:api_request_errors:ratio_rate6h > (6 * 0.005)
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: API is burning its error budget 6x too fast
+          description: "{{ $value | humanizePercentage }} of API requests are failing with 5xx."
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqerrorbudgetburn
+
+      - alert: AirqHighLatency
+        expr: airq:api_request_latency_under_1s:ratio_rate5m < 0.99
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Fewer than 99% of API requests complete within 1s
+          description: "Only {{ $value | humanizePercentage }} of requests are under 1s."
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqhighlatency
+
+      - alert: AirqUpstreamCircuitOpen
+        expr: max by (upstream) (airq_upstream_circuit_state) == 2
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: Circuit breaker for {{ $labels.upstream }} is open
+          description: The vendor is failing; cached data is served where available and new locations fail with 503.
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqupstreamcircuitopen
+      - alert: AirqUpstreamErrors
+        expr: upstream:airq_upstream_calls:error_ratio_5m > 0.2
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of {{ $labels.upstream }} calls are failing"
+          description: Check airq_upstream_calls_total by outcome to see whether it is timeouts, 429s or 5xx.
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqupstreamerrors
+      - alert: AirqServingStaleData
+        expr: sum by (cache) (rate(airq_cache_stale_served_total[5m])) > 0
+        for: 15m
+        labels: {severity: info}
+        annotations:
+          summary: Stale {{ $labels.cache }} data has been served for 15 minutes
+          description: The vendor is failing and responses come from the stale-if-error window (CACHE_STALE_FOR).
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqservingstaledata
+
+      - alert: AirqLoadShedding
+        expr: sum(rate(airq_http_rejected_requests_total{reason="overloaded"}[5m])) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Requests are being shed at the HTTP_MAX_IN_FLIGHT limit
+          description: The instance is at capacity. Scale out or investigate slow requests.
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqloadshedding
+      - alert: AirqPanics
+        expr: increase(airq_http_panics_recovered_total[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: A handler panicked and was recovered
+          description: Search logs for "panic recovered" to find the stack trace.
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqpanics
+
+      - alert: AirqDatabaseDown
+        expr: airq_health_check_up{check="database"} == 0
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: PostgreSQL is unreachable from {{ $labels.instance }}
+          description: The API keeps serving; the upstream response audit log is not being written.
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqdatabasedown
+      - alert: AirqMigrationsPending
+        expr: airq_health_check_up{check="migrations"} == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: The database schema is behind the running release
+          description: Run `airq migrate up` (the compose `migrate` service does this on start).
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqmigrationspending
+      - alert: AirqRecorderLosingRecords
+        expr: sum(rate(airq_recorder_records_total{result=~"dropped|failed"}[5m])) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Upstream responses are not being persisted
+          description: The recorder queue is full or inserts are failing; audit rows are being lost.
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqrecorderlosingrecords
+      - alert: AirqRetentionStale
+        expr: time() - airq_retention_last_success_timestamp_seconds > 3 * 3600
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: Retention has not succeeded for over 3 hours
+          description: upstream_responses is growing without bound until retention recovers.
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqretentionstale
+      - alert: AirqDBPoolSaturated
+        expr: max by (instance) (go_sql_in_use_connections{db_name="airq"} / go_sql_max_open_connections{db_name="airq"}) > 0.9
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Database connection pool is over 90% in use
+          description: Writers are queueing for connections (see go_sql_wait_duration_seconds_total).
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqdbpoolsaturated
