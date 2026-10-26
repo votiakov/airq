@@ -2,8 +2,8 @@ package upstream
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/sony/gobreaker/v2"
 
-	"github.com/votiakov/airq/internal/resilience"
 	"github.com/votiakov/airq/internal/telemetry"
 )
 
@@ -52,7 +52,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}, []string{"upstream"}),
 		circuitState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: ns, Subsystem: sub, Name: "circuit_state",
-			Help: "Circuit breaker state: 0=closed, 1=half_open, 2=open.",
+			Help: "Circuit breaker state: 0=closed, 1=half-open, 2=open.",
 		}, []string{"upstream"}),
 		transitions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Subsystem: sub, Name: "circuit_transitions_total",
@@ -80,8 +80,8 @@ func (m *Metrics) init(upstream string) {
 	}
 	m.retries.WithLabelValues(upstream)
 	m.inFlight.WithLabelValues(upstream)
-	m.circuitState.WithLabelValues(upstream).Set(float64(resilience.StateClosed))
-	for _, s := range []resilience.State{resilience.StateClosed, resilience.StateHalfOpen, resilience.StateOpen} {
+	m.circuitState.WithLabelValues(upstream).Set(float64(gobreaker.StateClosed))
+	for _, s := range []gobreaker.State{gobreaker.StateClosed, gobreaker.StateHalfOpen, gobreaker.StateOpen} {
 		m.transitions.WithLabelValues(upstream, s.String())
 	}
 	m.conns.WithLabelValues(upstream, "true")

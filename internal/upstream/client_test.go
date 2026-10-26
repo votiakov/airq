@@ -14,9 +14,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/sony/gobreaker/v2"
 	"golang.org/x/time/rate"
-
-	"github.com/votiakov/airq/internal/resilience"
 )
 
 type memRecorder struct {
@@ -60,7 +59,8 @@ func newFixture(t *testing.T, handler http.HandlerFunc, mutate func(*Config)) *f
 		APIKey:           "secret-key",
 		AttemptTimeout:   500 * time.Millisecond,
 		MaxAttempts:      3,
-		Backoff:          resilience.Backoff{Base: time.Millisecond, Max: 5 * time.Millisecond},
+		RetryBaseDelay:   time.Millisecond,
+		RetryMaxDelay:    5 * time.Millisecond,
 		BreakerThreshold: 100,
 		BreakerCooldown:  time.Minute,
 		RateLimit:        rate.Inf,
@@ -193,7 +193,7 @@ func TestClientErrorIsNotRetriedAndCarriesReason(t *testing.T) {
 	if f.hits.Load() != 1 {
 		t.Errorf("4xx must not be retried, hits = %d", f.hits.Load())
 	}
-	if f.client.BreakerState() != resilience.StateClosed {
+	if f.client.breaker.State() != gobreaker.StateClosed {
 		t.Error("4xx must not trip the breaker even with threshold 1")
 	}
 	if uerr.Unavailable() {
@@ -273,8 +273,8 @@ func TestCircuitBreakerFailsFast(t *testing.T) {
 	for range 2 {
 		_ = f.client.GetJSON(context.Background(), "/", nil, &struct{}{})
 	}
-	if f.client.BreakerState() != resilience.StateOpen {
-		t.Fatalf("breaker = %s, want open", f.client.BreakerState())
+	if f.client.breaker.State() != gobreaker.StateOpen {
+		t.Fatalf("breaker = %s, want open", f.client.breaker.State())
 	}
 
 	err := f.client.GetJSON(context.Background(), "/", nil, &struct{}{})
@@ -285,11 +285,41 @@ func TestCircuitBreakerFailsFast(t *testing.T) {
 	if f.hits.Load() != 2 {
 		t.Errorf("open circuit must not reach the server, hits = %d", f.hits.Load())
 	}
-	if got := testutil.ToFloat64(f.metrics.circuitState.WithLabelValues("test")); got != float64(resilience.StateOpen) {
+	if got := testutil.ToFloat64(f.metrics.circuitState.WithLabelValues("test")); got != float64(gobreaker.StateOpen) {
 		t.Errorf("circuit_state gauge = %v", got)
 	}
 	if got := f.count(f.metrics.transitions, "test", "open"); got != 1 {
 		t.Errorf("transitions{open} = %v", got)
+	}
+}
+
+func TestCircuitBreakerRecoversThroughHalfOpen(t *testing.T) {
+	var healthy atomic.Bool
+	f := newFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		if !healthy.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}, func(c *Config) {
+		c.MaxAttempts = 1
+		c.BreakerThreshold = 1
+		c.BreakerCooldown = 50 * time.Millisecond
+	})
+	_ = f.client.GetJSON(context.Background(), "/", nil, &struct{}{})
+	if !f.client.CircuitOpen() {
+		t.Fatal("breaker should be open")
+	}
+	healthy.Store(true)
+	time.Sleep(60 * time.Millisecond)
+	if err := f.client.GetJSON(context.Background(), "/", nil, &struct{}{}); err != nil {
+		t.Fatalf("trial request after cooldown: %v", err)
+	}
+	if f.client.breaker.State() != gobreaker.StateClosed {
+		t.Errorf("breaker = %s, want closed after a successful trial", f.client.breaker.State())
+	}
+	if got := f.count(f.metrics.transitions, "test", "half-open"); got != 1 {
+		t.Errorf("transitions{half-open} = %v", got)
 	}
 }
 
@@ -326,7 +356,7 @@ func TestCanceledContextIsNotABreakerFailure(t *testing.T) {
 	if kindOf(t, err) != KindCanceled {
 		t.Fatalf("err = %v", err)
 	}
-	if f.client.BreakerState() != resilience.StateClosed {
+	if f.client.breaker.State() != gobreaker.StateClosed {
 		t.Error("caller cancellation must not trip the breaker")
 	}
 }

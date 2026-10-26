@@ -28,6 +28,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/cenkalti/backoff/v5"
 	"golang.org/x/time/rate"
 
 	"github.com/votiakov/airq/internal/airquality"
@@ -35,7 +36,6 @@ import (
 	"github.com/votiakov/airq/internal/health"
 	"github.com/votiakov/airq/internal/httpapi"
 	"github.com/votiakov/airq/internal/openmeteo"
-	"github.com/votiakov/airq/internal/resilience"
 	"github.com/votiakov/airq/internal/store"
 	"github.com/votiakov/airq/internal/telemetry"
 	"github.com/votiakov/airq/internal/upstream"
@@ -172,7 +172,7 @@ func serve(ctx context.Context, getenv func(string) string, stdout io.Writer, on
 		return upstream.New(upstream.Config{
 			Name: name, BaseURL: baseURL, APIKey: cfg.Upstream.APIKey, HTTPClient: httpClient,
 			AttemptTimeout: cfg.Upstream.AttemptTimeout, MaxAttempts: cfg.Upstream.MaxAttempts,
-			Backoff:          resilience.Backoff{Base: cfg.Upstream.RetryBaseDelay, Max: cfg.Upstream.RetryMaxDelay},
+			RetryBaseDelay: cfg.Upstream.RetryBaseDelay, RetryMaxDelay: cfg.Upstream.RetryMaxDelay,
 			BreakerThreshold: cfg.Upstream.BreakerThreshold, BreakerCooldown: cfg.Upstream.BreakerCooldown,
 			RateLimit: rate.Limit(cfg.Upstream.RateLimitRPS), RateBurst: cfg.Upstream.RateLimitBurst,
 			MaxConcurrent: cfg.Upstream.MaxConcurrent, MaxResponseBytes: cfg.Upstream.MaxResponseBytes,
@@ -190,7 +190,7 @@ func serve(ctx context.Context, getenv func(string) string, stdout io.Writer, on
 	for _, c := range []*upstream.Client{aqClient, geoClient} {
 		checks = append(checks, health.Check{Name: "upstream_" + c.Name(), Timeout: time.Second, Run: func(context.Context) error {
 			// Passive check: probing the vendor would spend quota on every scrape.
-			if c.BreakerState() == resilience.StateOpen {
+			if c.CircuitOpen() {
 				return errors.New("circuit open: vendor failing, serving cached data where available")
 			}
 			return nil
@@ -348,19 +348,24 @@ func migrate(ctx context.Context, args []string, getenv func(string) string, std
 // waitForDB retries until the database accepts connections (containers start in
 // parallel), with capped backoff bounded by ctx.
 func waitForDB(ctx context.Context, db *sql.DB, logger *slog.Logger) error {
-	b := resilience.Backoff{Base: 250 * time.Millisecond, Max: 5 * time.Second}
-	for attempt := 0; ; attempt++ {
+	attempt := 0
+	_, err := backoff.Retry(ctx, func() (struct{}, error) {
 		err := store.Ping(ctx, db, 3*time.Second)
-		if err == nil {
-			return nil
-		}
-		if attempt%5 == 0 {
+		if err != nil && attempt%5 == 0 {
 			logger.WarnContext(ctx, "waiting for database", "error", err)
 		}
-		if err := resilience.Sleep(ctx, b.Delay(attempt)+100*time.Millisecond); err != nil {
-			return fmt.Errorf("database not reachable: %w", err)
-		}
+		attempt++
+		return struct{}{}, err
+	}, backoff.WithBackOff(&backoff.ExponentialBackOff{
+		InitialInterval:     250 * time.Millisecond,
+		RandomizationFactor: backoff.DefaultRandomizationFactor,
+		Multiplier:          backoff.DefaultMultiplier,
+		MaxInterval:         5 * time.Second,
+	}), backoff.WithMaxElapsedTime(0)) // bounded by ctx, not by the library default
+	if err != nil {
+		return fmt.Errorf("database not reachable: %w", err)
 	}
+	return nil
 }
 
 // healthcheck probes the local liveness endpoint. Distroless images have no shell or

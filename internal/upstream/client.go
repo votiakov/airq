@@ -2,14 +2,19 @@
 //
 // Every call passes through, in order:
 //
-//  1. a circuit breaker that fails fast while the vendor is known to be down;
-//  2. a token-bucket quota guard so we never exceed the vendor's rate limit;
-//  3. a bulkhead (bounded concurrency) so a slow vendor cannot exhaust goroutines,
+//  1. a circuit breaker (sony/gobreaker) that fails fast while the vendor is known
+//     to be down;
+//  2. a token-bucket quota guard (x/time/rate) so we never exceed the vendor's rate
+//     limit;
+//  3. a bulkhead (x/sync/semaphore) so a slow vendor cannot exhaust goroutines,
 //     sockets or memory;
 //  4. a per-attempt timeout, a response size cap and strict JSON decoding;
-//  5. retries with capped, fully-jittered exponential backoff for transient failures,
-//     honouring Retry-After and never sleeping past the caller's deadline.
+//  5. retries (cenkalti/backoff) with capped, jittered exponential backoff for
+//     transient failures, honouring Retry-After and never sleeping past the caller's
+//     deadline.
 //
+// The libraries supply the mechanisms; this package owns the policy: which failures
+// are retryable, which count against the breaker, and how each is classified.
 // Each attempt is measured, logged and (optionally) handed to a Recorder for audit.
 package upstream
 
@@ -21,17 +26,21 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/cenkalti/backoff/v5"
+	"github.com/sony/gobreaker/v2"
+	"golang.org/x/sync/semaphore"
 	"golang.org/x/time/rate"
 
-	"github.com/votiakov/airq/internal/resilience"
 	"github.com/votiakov/airq/internal/telemetry"
 	"github.com/votiakov/airq/internal/version"
 )
@@ -42,6 +51,11 @@ const apiKeyParam = "apikey"
 
 // minAttemptBudget is the least remaining deadline worth starting a retry with.
 const minAttemptBudget = 100 * time.Millisecond
+
+// errNotSent reports to the breaker that an attempt was abandoned before reaching the
+// vendor (local throttling or caller cancellation), so it says nothing about the
+// vendor's health.
+var errNotSent = errors.New("request not sent")
 
 // Exchange describes one attempt that reached the network. It is handed to the
 // Recorder for persistence; Query never contains credentials.
@@ -73,8 +87,9 @@ type Config struct {
 	HTTPClient       *http.Client
 	AttemptTimeout   time.Duration
 	MaxAttempts      int
-	Backoff          resilience.Backoff
-	BreakerThreshold int
+	RetryBaseDelay   time.Duration // first backoff interval, doubled per retry
+	RetryMaxDelay    time.Duration // cap on a single backoff interval
+	BreakerThreshold int           // consecutive failures that open the circuit
 	BreakerCooldown  time.Duration
 	RateLimit        rate.Limit
 	RateBurst        int
@@ -88,12 +103,13 @@ type Config struct {
 
 // Client is safe for concurrent use.
 type Client struct {
-	cfg     Config
-	base    *url.URL
-	breaker *resilience.Breaker
-	limiter *rate.Limiter
-	sem     chan struct{}
-	log     *slog.Logger
+	cfg      Config
+	base     *url.URL
+	breaker  *gobreaker.TwoStepCircuitBreaker[struct{}]
+	openedAt atomic.Int64 // UnixNano of the last transition to open, for Retry-After hints
+	limiter  *rate.Limiter
+	bulkhead *semaphore.Weighted
+	log      *slog.Logger
 }
 
 // New creates a client. BaseURL must be an absolute http(s) URL.
@@ -111,6 +127,9 @@ func New(cfg Config) (*Client, error) {
 	if cfg.MaxConcurrent < 1 {
 		cfg.MaxConcurrent = 1
 	}
+	if cfg.BreakerThreshold < 1 {
+		cfg.BreakerThreshold = 1
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
@@ -123,23 +142,39 @@ func New(cfg Config) (*Client, error) {
 	cfg.Metrics.init(cfg.Name)
 
 	c := &Client{
-		cfg:     cfg,
-		base:    base,
-		limiter: rate.NewLimiter(cfg.RateLimit, max(cfg.RateBurst, 1)),
-		sem:     make(chan struct{}, cfg.MaxConcurrent),
-		log:     cfg.Logger.With(slog.String("upstream", cfg.Name)),
+		cfg:      cfg,
+		base:     base,
+		limiter:  rate.NewLimiter(cfg.RateLimit, max(cfg.RateBurst, 1)),
+		bulkhead: semaphore.NewWeighted(int64(cfg.MaxConcurrent)),
+		log:      cfg.Logger.With(slog.String("upstream", cfg.Name)),
 	}
-	c.breaker = resilience.NewBreaker(resilience.BreakerConfig{
-		FailureThreshold: cfg.BreakerThreshold,
-		Cooldown:         cfg.BreakerCooldown,
-		Now:              cfg.Now,
-		OnStateChange: func(from, to resilience.State) {
+	threshold := uint32(min(cfg.BreakerThreshold, math.MaxUint32)) //nolint:gosec // bounded to [1, MaxUint32]
+	c.breaker = gobreaker.NewTwoStepCircuitBreaker[struct{}](gobreaker.Settings{
+		Name:        cfg.Name,
+		MaxRequests: 1, // a single trial request while half-open
+		Timeout:     cfg.BreakerCooldown,
+		ReadyToTrip: func(counts gobreaker.Counts) bool { return counts.ConsecutiveFailures >= threshold },
+		IsExcluded:  excludedFromBreaker,
+		OnStateChange: func(_ string, from, to gobreaker.State) {
+			if to == gobreaker.StateOpen {
+				c.openedAt.Store(time.Now().UnixNano())
+			}
 			cfg.Metrics.circuitState.WithLabelValues(cfg.Name).Set(float64(to))
 			cfg.Metrics.transitions.WithLabelValues(cfg.Name, to.String()).Inc()
 			c.log.Warn("circuit breaker state changed", "from", from.String(), "to", to.String())
 		},
 	})
 	return c, nil
+}
+
+// excludedFromBreaker reports failures that are not the vendor's fault: our own bad
+// requests, departed callers and attempts that never left the process.
+func excludedFromBreaker(err error) bool {
+	if errors.Is(err, errNotSent) {
+		return true
+	}
+	var uerr *Error
+	return errors.As(err, &uerr) && (uerr.Kind == KindClient || uerr.Kind == KindCanceled)
 }
 
 // NewHTTPClient returns an http.Client tuned for calling a single API host: bounded
@@ -174,8 +209,8 @@ func NewHTTPClient(responseHeaderTimeout time.Duration) *http.Client {
 // Name returns the upstream name.
 func (c *Client) Name() string { return c.cfg.Name }
 
-// BreakerState returns the circuit breaker state (used by health checks).
-func (c *Client) BreakerState() resilience.State { return c.breaker.State() }
+// CircuitOpen reports whether the breaker is failing fast (used by health checks).
+func (c *Client) CircuitOpen() bool { return c.breaker.State() == gobreaker.StateOpen }
 
 // GetJSON performs GET base+path?query and decodes a 200 response into out.
 func (c *Client) GetJSON(ctx context.Context, path string, query url.Values, out any) error {
@@ -203,41 +238,64 @@ func (c *Client) getJSON(ctx context.Context, path string, query url.Values, out
 	}
 	target.RawQuery = q.Encode()
 
-	var lastErr *Error
-	for attempt := 1; attempt <= c.cfg.MaxAttempts; attempt++ {
-		if attempt > 1 {
-			delay := max(c.cfg.Backoff.Delay(attempt-2), lastErr.RetryAfter)
-			if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < delay+minAttemptBudget {
-				c.log.DebugContext(ctx, "not retrying: insufficient deadline budget", "attempt", attempt, "delay", delay)
-				break
-			}
-			c.cfg.Metrics.retries.WithLabelValues(c.cfg.Name).Inc()
-			if err := resilience.Sleep(ctx, delay); err != nil {
-				return c.contextError(err)
-			}
-		}
+	attempt := 0
+	op := func() (struct{}, error) {
+		attempt++
 		err := c.attempt(ctx, attempt, target, out)
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		if !err.retryable() {
-			break
+		switch {
+		case err == nil:
+			return struct{}{}, nil
+		case !err.retryable():
+			return struct{}{}, backoff.Permanent(err)
+		case err.RetryAfter > 0:
+			// The vendor's explicit hint replaces our own schedule.
+			return struct{}{}, errors.Join(err, &backoff.RetryAfterError{Duration: err.RetryAfter})
+		default:
+			return struct{}{}, err
 		}
 	}
-	return lastErr
+	_, err := backoff.Retry(ctx, op,
+		backoff.WithBackOff(&backoff.ExponentialBackOff{
+			InitialInterval:     c.cfg.RetryBaseDelay,
+			RandomizationFactor: backoff.DefaultRandomizationFactor,
+			Multiplier:          backoff.DefaultMultiplier,
+			MaxInterval:         c.cfg.RetryMaxDelay,
+		}),
+		backoff.WithMaxTries(uint(c.cfg.MaxAttempts)), // clamped to >= 1 in New
+		backoff.WithMaxElapsedTime(retryBudget(ctx)),
+		backoff.WithNotify(func(error, time.Duration) { c.cfg.Metrics.retries.WithLabelValues(c.cfg.Name).Inc() }),
+	)
+	if err == nil {
+		return nil
+	}
+	var uerr *Error
+	if errors.As(err, &uerr) {
+		return uerr
+	}
+	return c.contextError(ctx.Err()) // cancelled while backing off
+}
+
+// retryBudget bounds the retry loop so a backoff sleep only starts when an attempt
+// could still finish before the caller's deadline. Zero means no deadline (MaxTries
+// still applies).
+func retryBudget(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	return max(time.Until(deadline)-minAttemptBudget, time.Nanosecond)
 }
 
 func (c *Client) attempt(ctx context.Context, attempt int, target *url.URL, out any) *Error {
 	name := c.cfg.Name
-	done, err := c.breaker.Allow()
+	done, err := c.breaker.Allow() // ErrOpenState, or ErrTooManyRequests while a half-open trial runs
 	if err != nil {
 		c.cfg.Metrics.attempts.WithLabelValues(name, string(KindCircuitOpen)).Inc()
-		return &Error{Upstream: name, Kind: KindCircuitOpen, RetryAfter: c.breaker.RetryAfter(), Err: err}
+		return &Error{Upstream: name, Kind: KindCircuitOpen, RetryAfter: c.circuitRetryAfter(), Err: err}
 	}
 
 	if uerr := c.admit(ctx); uerr != nil {
-		done(resilience.Ignored)
+		done(errNotSent)
 		c.cfg.Metrics.attempts.WithLabelValues(name, string(uerr.Kind)).Inc()
 		return uerr
 	}
@@ -248,15 +306,12 @@ func (c *Client) attempt(ctx context.Context, attempt int, target *url.URL, out 
 	elapsed := c.cfg.Now().Sub(start)
 
 	outcome := "success"
-	brOutcome := resilience.Success
 	if uerr != nil {
 		outcome = string(uerr.Kind)
-		brOutcome = resilience.Failure
-		if uerr.Kind == KindClient || uerr.Kind == KindCanceled {
-			brOutcome = resilience.Ignored // not the vendor's fault
-		}
+		done(uerr)
+	} else {
+		done(nil)
 	}
-	done(brOutcome)
 
 	c.cfg.Metrics.attempts.WithLabelValues(name, outcome).Inc()
 	telemetry.ObserveWithExemplar(ctx, c.cfg.Metrics.duration.WithLabelValues(name, outcome), elapsed.Seconds())
@@ -304,21 +359,26 @@ func (c *Client) admit(ctx context.Context) *Error {
 	}
 	c.cfg.Metrics.limiterWait.WithLabelValues(c.cfg.Name).Observe(time.Since(waitStart).Seconds())
 
-	select {
-	case c.sem <- struct{}{}:
-		c.cfg.Metrics.inFlight.WithLabelValues(c.cfg.Name).Inc()
-		return nil
-	case <-ctx.Done():
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	if err := c.bulkhead.Acquire(ctx, 1); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
 			return &Error{Upstream: c.cfg.Name, Kind: KindThrottled, Err: errors.New("bulkhead full")}
 		}
-		return c.contextError(ctx.Err())
+		return c.contextError(err)
 	}
+	c.cfg.Metrics.inFlight.WithLabelValues(c.cfg.Name).Inc()
+	return nil
 }
 
 func (c *Client) release() {
-	<-c.sem
+	c.bulkhead.Release(1)
 	c.cfg.Metrics.inFlight.WithLabelValues(c.cfg.Name).Dec()
+}
+
+// circuitRetryAfter estimates when the open circuit will admit a trial request.
+// gobreaker does not expose this, so the transition time is tracked in OnStateChange.
+func (c *Client) circuitRetryAfter() time.Duration {
+	remaining := c.cfg.BreakerCooldown - time.Since(time.Unix(0, c.openedAt.Load()))
+	return max(remaining, time.Second)
 }
 
 // do performs a single HTTP exchange and returns the status code and raw body (for
@@ -364,10 +424,10 @@ func (c *Client) do(ctx context.Context, target *url.URL, out any) (int, []byte,
 		}
 		return resp.StatusCode, body, nil
 	case resp.StatusCode == http.StatusTooManyRequests:
-		ra, _ := resilience.ParseRetryAfter(resp.Header.Get("Retry-After"), c.cfg.Now())
+		ra, _ := parseRetryAfter(resp.Header.Get("Retry-After"), c.cfg.Now())
 		return resp.StatusCode, body, &Error{Upstream: name, Kind: KindRateLimited, StatusCode: resp.StatusCode, RetryAfter: ra}
 	case resp.StatusCode >= 500:
-		ra, _ := resilience.ParseRetryAfter(resp.Header.Get("Retry-After"), c.cfg.Now())
+		ra, _ := parseRetryAfter(resp.Header.Get("Retry-After"), c.cfg.Now())
 		return resp.StatusCode, body, &Error{Upstream: name, Kind: KindServer, StatusCode: resp.StatusCode, RetryAfter: ra}
 	case resp.StatusCode >= 400:
 		return resp.StatusCode, body, &Error{Upstream: name, Kind: KindClient, StatusCode: resp.StatusCode, Reason: vendorReason(body)}
