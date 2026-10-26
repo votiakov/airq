@@ -69,7 +69,7 @@ The response includes pollutant concentrations, the European AQI (`good` … `ex
 and US AQI (`good` … `hazardous`) with their categories, the resolved location and an attribution notice.
 
 Caching is visible in every response:
-- `X-Cache: HIT|MISS|STALE`, an RFC 9211 `Cache-Status` and `Age`.
+- `X-Cache: HIT|MISS|STALE|REVALIDATING`, an RFC 9211 `Cache-Status` and `Age`.
 - `Cache-Control: max-age` set to the remaining freshness.
 - A strong `ETag`, so `If-None-Match` returns `304`.
 
@@ -81,7 +81,8 @@ Status codes:
 | `404` | Unknown place. |
 | `429` | Per-client rate limit hit. Includes `Retry-After`. |
 | `503` | Overloaded, or the vendor is down and nothing is cached. Includes `Retry-After`. |
-| `502` / `504` | The vendor failed, or timed out. |
+| `429` (miss budget) | This client used up its allowance of uncached lookups. Includes `Retry-After`. |
+| `502` / `504` | The vendor failed, refused us (`upstream_rejected`), or timed out. |
 
 ## How it behaves when things break
 
@@ -123,6 +124,7 @@ logged at startup, with secrets redacted.
 | `HTTP_MAX_HEADER_BYTES` | `16384` | Request header size limit |
 | `HTTP_MAX_IN_FLIGHT` | `256` | Concurrent API requests before shedding with `503` |
 | `HTTP_RATE_LIMIT_RPS` / `HTTP_RATE_LIMIT_BURST` | `10` / `20` | Per-client-IP token bucket |
+| `HTTP_MISS_RATE_LIMIT_RPS` / `HTTP_MISS_RATE_LIMIT_BURST` | `2` / `20` | Per-client budget for requests that need the vendor (cache misses), so one client cannot drain the shared vendor quota. Cached answers are free. |
 | `HTTP_TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` and incoming `traceparent` (only behind your own proxy) |
 | `HTTP_DRAIN_DELAY` / `HTTP_SHUTDOWN_TIMEOUT` | `5s` / `20s` | Graceful shutdown: not-ready period, then the in-flight deadline |
 | `UPSTREAM_AIR_QUALITY_URL` / `UPSTREAM_GEOCODING_URL` | Open-Meteo | Vendor base URLs |
@@ -132,10 +134,12 @@ logged at startup, with secrets redacted.
 | `UPSTREAM_RATE_LIMIT_RPS` / `UPSTREAM_RATE_LIMIT_BURST` | `5` / `10` | Outbound quota guard |
 | `UPSTREAM_MAX_CONCURRENT` | `16` | Bulkhead: concurrent vendor calls per upstream |
 | `UPSTREAM_BREAKER_THRESHOLD` / `UPSTREAM_BREAKER_COOLDOWN` | `5` / `30s` | Consecutive failures to open the circuit, and the open period |
+| `UPSTREAM_BREAKER_FAILURE_RATIO` / `UPSTREAM_BREAKER_MIN_CALLS` / `UPSTREAM_BREAKER_WINDOW` | `0.5` / `20` / `1m` | Also open the circuit when this share of at least N calls in the window failed (`0` disables) |
 | `UPSTREAM_MAX_RESPONSE_BYTES` | `1048576` | Vendor response size cap |
 | `CACHE_MAX_ENTRIES` | `5000` | Per-cache LRU bound |
 | `CACHE_CURRENT_TTL` / `CACHE_FORECAST_TTL` / `CACHE_GEOCODE_TTL` / `CACHE_NOT_FOUND_TTL` | `10m` / `30m` / `24h` / `10m` | Freshness per data type |
 | `CACHE_STALE_FOR` | `1h` | How long expired entries may be served while the vendor fails |
+| `CACHE_REVALIDATE_WINDOW` | `30s` | Stale-while-revalidate: just-expired entries are served at once (`X-Cache: REVALIDATING`) while one background fetch refreshes them (`0` disables) |
 | `DATABASE_URL` | — | PostgreSQL DSN for the service role. Empty disables the audit log. |
 | `MIGRATE_DATABASE_URL` | `DATABASE_URL` | DSN for `airq migrate` (the DDL role) |
 | `DB_MAX_OPEN_CONNS` / `DB_MAX_IDLE_CONNS` | `10` / `5` | Pool size |

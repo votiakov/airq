@@ -106,11 +106,11 @@ Take `GET /v1/air-quality/london` as an example.
    3. **Bulkhead** (`semaphore`, 16 per upstream): a slow vendor cannot absorb every
       goroutine and connection.
    4. **The HTTP attempt**, with its own deadline (3s). The body is capped at 1 MiB
-      and must be JSON. The URL recorded in spans has the API key stripped. No trace
+      and must decode as JSON into typed values. The URL recorded in spans has the API key stripped. No trace
       headers are sent to the vendor.
    5. **Classification** into a `Kind`. Retryable kinds are timeout, network, 429 and
-      5xx; a 429's `Retry-After` is honoured. Retries use exponential backoff with
-      full jitter and never sleep past the request deadline. Client errors (4xx) and
+      5xx; a 429's `Retry-After` is honoured, capped at 2 minutes. Retries use exponential backoff with
+      randomised (±50%) backoff and never sleep past the request deadline. Client errors (4xx) and
       caller cancellations never trip the breaker.
 8. **Every attempt is handed to the recorder** (non-blocking, see below), whatever its outcome.
 9. **Respond.** The response carries `ETag`, `Cache-Control: max-age` (the remaining

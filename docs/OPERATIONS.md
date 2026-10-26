@@ -73,6 +73,7 @@ messages and, with `PPROF_ENABLED=true`, `/debug/pprof/`.
 | [AirqHighLatency](#airqhighlatency) | warning | < 99% of requests under 1s for 10m |
 | [AirqUpstreamCircuitOpen](#airqupstreamcircuitopen) | warning | A vendor circuit has been open for 1m |
 | [AirqUpstreamErrors](#airqupstreamerrors) | warning | > 20% of vendor calls failing for 10m |
+| [AirqUpstreamRejected](#airqupstreamrejected) | critical | The vendor answers 401/403/404/410 for 5m |
 | [AirqServingStaleData](#airqservingstaledata) | info | Stale entries served for 15m |
 | [AirqLoadShedding](#airqloadshedding) | warning | Requests rejected at `HTTP_MAX_IN_FLIGHT` for 5m |
 | [AirqPanics](#airqpanics) | warning | Any recovered handler panic in 10m |
@@ -192,6 +193,16 @@ necessarily tripping the breaker. The vendor is flaky rather than down.
 
 **Mitigate:** Same as [AirqUpstreamCircuitOpen](#airqupstreamcircuitopen). For a
 schema change, ship an adapter fix.
+
+### AirqUpstreamRejected
+
+**Meaning:** The vendor is refusing us (HTTP 401, 403, 404 or 410), not complaining about one bad request. Usual causes: a revoked or wrong `UPSTREAM_API_KEY`, an exhausted plan, or a retired or moved endpoint.
+
+**Impact:** Cached and stale-window locations are still served; everything else gets `502 upstream_rejected`. The circuit opens after repeated refusals, so quota is not wasted.
+
+**Diagnose:** `jq 'select(.msg=="provider refused our request")'` on the logs (the vendor's reason is included), and the failure rows in `upstream_responses` (`outcome = 'rejected'`).
+
+**Mitigate:** Fix the key or plan, or ship an adapter change for a moved endpoint. Stale data ages out after `CACHE_STALE_FOR`, so act within the hour.
 
 ### AirqServingStaleData
 
@@ -337,13 +348,15 @@ never raw paths, so cardinality stays bounded.
 | `airq_http_requests_total` | counter | `method`, `route`, `code` | Requests served |
 | `airq_http_request_duration_seconds` | histogram | `method`, `route`, `code` | Latency, with trace exemplars |
 | `airq_http_requests_in_flight` | gauge | | Requests being served |
-| `airq_http_rejected_requests_total` | counter | `reason` (`rate_limited`, `overloaded`) | Rejected before reaching a handler |
+| `airq_http_rejected_requests_total` | counter | `reason` (`rate_limited`, `miss_limited`, `overloaded`) | Rejected before reaching a handler |
 | `airq_http_panics_recovered_total` | counter | | Recovered handler panics |
 | `airq_cache_lookups_total` | counter | `cache`, `result` (`hit`, `stale`, `miss`) | Cache lookups |
 | `airq_cache_entries` | gauge | `cache` | Entries, including stale ones |
 | `airq_cache_evictions_total` | counter | `cache`, `reason` (`capacity`, `expired`) | Evictions |
 | `airq_cache_stale_served_total` | counter | `cache` | Stale entries served because the vendor failed |
 | `airq_cache_coalesced_requests_total` | counter | `cache` | Requests that joined an in-flight fetch |
+| `airq_cache_fetch_panics_recovered_total` | counter | `cache` | Panics recovered inside a shared fetch (a bug) |
+| `airq_cache_revalidations_total` | counter | `cache`, `result` | Background stale-while-revalidate refreshes |
 | `airq_upstream_calls_total` | counter | `upstream`, `outcome` | Logical vendor calls, after retries |
 | `airq_upstream_attempts_total` | counter | `upstream`, `outcome` | Individual attempts, including ones rejected locally (`circuit_open`, `throttled`) |
 | `airq_upstream_attempt_duration_seconds` | histogram | `upstream`, `outcome` | Latency of attempts that reached the network |

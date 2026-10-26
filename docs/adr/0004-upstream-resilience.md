@@ -26,7 +26,7 @@ outage on our side in four ways:
    - the HTTP status returned to clients;
    - metric labels.
 2. **Deadline-budgeted retries** (`cenkalti/backoff/v5`): up to `UPSTREAM_MAX_ATTEMPTS`
-   attempts, using exponential backoff with full jitter (100ms base, 1s cap).
+   attempts, using exponential backoff randomised ±50% (100ms base, 1s cap).
    - Only `timeout`, `network`, `rate_limited` and `server_error` are retried.
    - A vendor `Retry-After` is honoured.
    - The total elapsed time is capped at the caller's remaining deadline, so a retry

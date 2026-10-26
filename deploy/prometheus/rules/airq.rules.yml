@@ -99,6 +99,15 @@ groups:
           summary: "{{ $value | humanizePercentage }} of {{ $labels.upstream }} calls are failing"
           description: Check airq_upstream_calls_total by outcome to see whether it is timeouts, 429s or 5xx.
           runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqupstreamerrors
+      - alert: AirqUpstreamRejected
+        expr: sum by (upstream) (rate(airq_upstream_calls_total{outcome="rejected"}[5m])) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.upstream }} is refusing our requests (401/403/404/410)"
+          description: A revoked key, exhausted plan or retired endpoint. Cached data covers for it until it ages out.
+          runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqupstreamrejected
+
       - alert: AirqServingStaleData
         expr: sum by (cache) (rate(airq_cache_stale_served_total[5m])) > 0
         for: 15m
@@ -117,7 +126,9 @@ groups:
           description: The instance is at capacity. Scale out or investigate slow requests.
           runbook_url: https://github.com/votiakov/airq/blob/main/docs/OPERATIONS.md#airqloadshedding
       - alert: AirqPanics
-        expr: increase(airq_http_panics_recovered_total[10m]) > 0
+        expr: |
+          sum(increase(airq_http_panics_recovered_total[10m]))
+          + sum(increase(airq_cache_fetch_panics_recovered_total[10m])) > 0
         labels: {severity: warning}
         annotations:
           summary: A handler panicked and was recovered
