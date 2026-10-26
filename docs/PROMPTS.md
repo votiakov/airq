@@ -64,8 +64,41 @@ commit. The full built-vs-borrowed inventory, with the reason for every entry, i
 > run parallel agent (sonnet) to create a full testing/acceptance plan for the build. do
 > not run it yet - plan it and show it to me for approval
 
-Outcome: a Sonnet subagent drafted the plan (read-only, in parallel with the refactor)
-for approval before anything was executed.
+Outcome: a Sonnet subagent drafted the plan (read-only, in parallel with the refactor):
+about 200 checks across build, tests, the single-command run, API, caching, resilience,
+health, shutdown, database, observability, security, CI, docs and load. It was
+presented for approval and has not been executed as a whole. Gaps it found were fixed
+directly because they were defects, not tests:
+- the recorder could pin about 1 GiB of vendor bodies while the database was stalled;
+- client-supplied secrets in query strings reached the access log;
+- the service had no least-privilege database role;
+- ADR 0005 was referenced but missing.
+
+## 5. Automated goal check
+
+The session ran with the initial goal as a completion condition. When the agent
+stopped to ask for plan approval, the check replied that the goal was not yet met:
+- no CI/CD workflows;
+- no README, architecture, operations or security docs;
+- no Makefile;
+- no verified end-to-end run of the compose stack.
+
+Outcome:
+- **Disk.** The Docker disk was full, which blocked Postgres and had also crashed a
+  container from another project. The agent freed only the space its own session had
+  used: its test container, its volumes and the 1.8 GB Grafana image. Everything else
+  was left alone.
+- **Smoke test.** The agent wrote `scripts/smoke.sh` and ran it against the real stack
+  with the mock vendor. All 30 checks passed after fixing two script bugs: a counter
+  evaluated only once, and Jaeger v2's `/api/v3` path.
+- **Vulnerability found and fixed.** The run showed the public `/health` returning raw
+  driver errors: database user, database name and internal DNS. It was fixed in
+  `fix(health)`.
+- **Database-down drill** run by hand: the API kept serving, `/health` reported
+  `degraded`, and it recovered without a restart.
+- **Added:** the GitHub Actions pipeline (CI, CodeQL, PR checks, Dependabot), the
+  Makefile, `.env.example`, the README, the architecture, operations and security
+  docs, and ADRs 0002–0008.
 
 ## How the agent worked through it
 
@@ -79,5 +112,10 @@ for approval before anything was executed.
    or alongside each feature.
 4. **Build in vertical slices.** Each feature landed with its own tests and Prometheus
    metrics, in small conventional commits.
-5. **Verify.** Ran `go test -race`, `golangci-lint` and a `docker compose` smoke test
-   against the real stack before each infrastructure commit.
+5. **Verify.**
+   - Ran `go test -race` (including the PostgreSQL integration tests) and
+     `golangci-lint` before each commit.
+   - Ran promtool and actionlint on the ops config and workflows.
+   - Ran `scripts/smoke.sh` against the real compose stack.
+   - Every pinned action SHA was checked against its release tag through the GitHub
+     API.
