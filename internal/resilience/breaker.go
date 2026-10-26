@@ -111,6 +111,7 @@ func (b *Breaker) Allow() (done func(Outcome), err error) {
 		transition = b.setStateLocked(StateHalfOpen)
 	}
 	switch b.state {
+	case StateClosed:
 	case StateOpen:
 		b.mu.Unlock()
 		return nil, ErrCircuitOpen

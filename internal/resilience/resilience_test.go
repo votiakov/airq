@@ -183,7 +183,7 @@ func TestBreakerDiscardsStaleGenerationOutcomes(t *testing.T) {
 	}
 }
 
-func TestBreakerConcurrentUse(t *testing.T) {
+func TestBreakerConcurrentUse(_ *testing.T) {
 	b := NewBreaker(BreakerConfig{FailureThreshold: 1000, Cooldown: time.Second})
 	var wg sync.WaitGroup
 	for i := range 50 {
