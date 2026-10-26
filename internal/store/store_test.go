@@ -5,8 +5,11 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"io/fs"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -75,63 +78,42 @@ func migrated(t *testing.T) *sql.DB {
 	return db
 }
 
-func TestLoadMigrations(t *testing.T) {
-	migs, err := LoadMigrations(fstest.MapFS{
-		"000002_second.up.sql":   {Data: []byte("-- airq:no-transaction\nCREATE INDEX CONCURRENTLY x ON t (a);")},
-		"000001_first.up.sql":    {Data: []byte("CREATE TABLE t (a int);")},
-		"000001_first.down.sql":  {Data: []byte("DROP TABLE t;")},
-		"README.md":              {Data: []byte("ignored")},
-		"000010_tenth.up.sql":    {Data: []byte("SELECT 1;")},
-		"000010_tenth.down.sql":  {Data: []byte("SELECT 1;")},
-		"subdir/000099_x.up.sql": {Data: []byte("ignored: only the top level is read")},
-	})
+// migrationName mirrors the convention documented in migrations/embed.go.
+var migrationName = regexp.MustCompile(`^(\d{6})_[a-z0-9_]+\.sql$`)
+
+// TestEmbeddedMigrationsFollowConventions runs without a database so naming and
+// structure mistakes fail fast in every build.
+func TestEmbeddedMigrationsFollowConventions(t *testing.T) {
+	entries, err := fs.ReadDir(migrations.FS, ".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migs) != 3 || migs[0].Version != 1 || migs[1].Version != 2 || migs[2].Version != 10 {
-		t.Fatalf("unexpected order: %+v", migs)
-	}
-	if migs[0].NoTx || !migs[1].NoTx {
-		t.Error("no-transaction directive not detected")
-	}
-	if migs[0].Down == "" || migs[0].Checksum == "" {
-		t.Error("down script or checksum missing")
-	}
-}
-
-func TestLoadMigrationsRejectsMistakes(t *testing.T) {
-	tests := map[string]fstest.MapFS{
-		"bad name":       {"1-first.sql": {Data: []byte("x")}},
-		"missing up":     {"000001_first.down.sql": {Data: []byte("x")}},
-		"empty up":       {"000001_first.up.sql": {Data: []byte("  ")}},
-		"name conflict":  {"000001_a.up.sql": {Data: []byte("x")}, "000001_b.down.sql": {Data: []byte("x")}},
-		"version zero":   {"000000_zero.up.sql": {Data: []byte("x")}},
-		"uppercase name": {"000001_First.up.sql": {Data: []byte("x")}},
-	}
-	for name, fsys := range tests {
-		t.Run(name, func(t *testing.T) {
-			if _, err := LoadMigrations(fsys); err == nil {
-				t.Fatal("expected error")
+	version := 0
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		m := migrationName.FindStringSubmatch(e.Name())
+		if m == nil {
+			t.Errorf("%s: must be named NNNNNN_lower_snake_case.sql", e.Name())
+			continue
+		}
+		version++
+		if n, _ := strconv.Atoi(m[1]); n != version {
+			t.Errorf("%s: versions must be contiguous, want %06d", e.Name(), version)
+		}
+		body, _ := fs.ReadFile(migrations.FS, e.Name())
+		for _, section := range []string{"-- +goose Up", "-- +goose Down"} {
+			if !strings.Contains(string(body), section) {
+				t.Errorf("%s: missing %q section", e.Name(), section)
 			}
-		})
+		}
 	}
-}
-
-func TestEmbeddedMigrationsAreValid(t *testing.T) {
-	migs, err := LoadMigrations(migrations.FS)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(migs) == 0 {
+	if version == 0 {
 		t.Fatal("no migrations embedded")
 	}
-	for i, m := range migs {
-		if m.Version != int64(i+1) {
-			t.Errorf("migration versions must be contiguous: got %d at position %d", m.Version, i)
-		}
-		if strings.TrimSpace(m.Down) == "" {
-			t.Errorf("migration %d has no down script", m.Version)
-		}
+	if _, err := NewMigrator(&sql.DB{}, migrations.FS, nil); err != nil {
+		t.Fatalf("goose rejects the embedded migrations: %v", err)
 	}
 }
 
@@ -171,36 +153,18 @@ func TestMigratorUpDownUp(t *testing.T) {
 	if n, err := m.Up(ctx); err != nil || n != total {
 		t.Fatalf("re-Up = %d, %v", n, err)
 	}
-
-	// The migrator's session overrides must not leak into pooled connections.
-	var timeout string
-	if err := db.QueryRowContext(ctx, `SHOW statement_timeout`).Scan(&timeout); err != nil || timeout != "5s" {
-		t.Errorf("statement_timeout after migration = %q, %v; want 5s", timeout, err)
-	}
-}
-
-func TestMigratorDetectsChecksumDrift(t *testing.T) {
-	db := testDB(t)
-	ctx := context.Background()
-	orig := fstest.MapFS{"000001_t.up.sql": {Data: []byte("CREATE TABLE drift (a int);")}}
-	m, _ := NewMigrator(db, orig, nil)
-	if _, err := m.Up(ctx); err != nil {
-		t.Fatal(err)
-	}
-	edited := fstest.MapFS{"000001_t.up.sql": {Data: []byte("CREATE TABLE drift (a bigint);")}}
-	m2, _ := NewMigrator(db, edited, nil)
-	if _, err := m2.Up(ctx); err == nil || !strings.Contains(err.Error(), "modified after it was applied") {
-		t.Fatalf("expected drift error, got %v", err)
-	}
 }
 
 func TestMigratorFailureRollsBack(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
-	m, _ := NewMigrator(db, fstest.MapFS{
-		"000001_ok.up.sql":     {Data: []byte("CREATE TABLE ok (a int);")},
-		"000002_broken.up.sql": {Data: []byte("CREATE TABLE half (a int); SELECT * FROM does_not_exist;")},
+	m, err := NewMigrator(db, fstest.MapFS{
+		"000001_ok.sql":     {Data: []byte("-- +goose Up\nCREATE TABLE ok (a int);\n-- +goose Down\nDROP TABLE ok;")},
+		"000002_broken.sql": {Data: []byte("-- +goose Up\nCREATE TABLE half (a int);\nSELECT * FROM does_not_exist;\n-- +goose Down\nSELECT 1;")},
 	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := m.Up(ctx); err == nil {
 		t.Fatal("expected failure")
 	}
@@ -214,12 +178,32 @@ func TestMigratorFailureRollsBack(t *testing.T) {
 
 func TestMigratorNoTransaction(t *testing.T) {
 	db := testDB(t)
-	m, _ := NewMigrator(db, fstest.MapFS{
-		"000001_t.up.sql":   {Data: []byte("CREATE TABLE c (a int);")},
-		"000002_idx.up.sql": {Data: []byte("-- airq:no-transaction\nCREATE INDEX CONCURRENTLY IF NOT EXISTS c_a_idx ON c (a);")},
+	m, err := NewMigrator(db, fstest.MapFS{
+		"000001_t.sql": {Data: []byte("-- +goose Up\nCREATE TABLE c (a int);\n-- +goose Down\nDROP TABLE c;")},
+		"000002_idx.sql": {Data: []byte("-- +goose NO TRANSACTION\n-- +goose Up\n" +
+			"CREATE INDEX CONCURRENTLY IF NOT EXISTS c_a_idx ON c (a);\n-- +goose Down\nDROP INDEX CONCURRENTLY c_a_idx;")},
 	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if n, err := m.Up(context.Background()); err != nil || n != 2 {
 		t.Fatalf("Up = %d, %v (CONCURRENTLY fails inside a transaction)", n, err)
+	}
+}
+
+func TestMigratorPendingHasNoSideEffects(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	m, err := NewMigrator(db, migrations.FS, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := m.Pending(ctx); err != nil || n == 0 {
+		t.Fatalf("Pending = %d, %v", n, err)
+	}
+	var exists bool
+	if err := db.QueryRowContext(ctx, `SELECT to_regclass('goose_db_version') IS NOT NULL`).Scan(&exists); err != nil || exists {
+		t.Fatalf("Pending must not create the version table (exists=%v, err=%v)", exists, err)
 	}
 }
 
@@ -230,7 +214,11 @@ func TestMigratorConcurrentRunsApplyOnce(t *testing.T) {
 	total := 0
 	for range 4 {
 		wg.Go(func() {
-			m, _ := NewMigrator(db, migrations.FS, nil)
+			m, err := NewMigrator(db, migrations.FS, nil)
+			if err != nil {
+				t.Error(err)
+				return
+			}
 			n, err := m.Up(context.Background())
 			if err != nil {
 				t.Error(err)
@@ -241,9 +229,9 @@ func TestMigratorConcurrentRunsApplyOnce(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	migs, _ := LoadMigrations(migrations.FS)
-	if total != len(migs) {
-		t.Fatalf("migrations applied %d times in total, want %d (advisory lock)", total, len(migs))
+	files, _ := fs.Glob(migrations.FS, "*.sql")
+	if total != len(files) {
+		t.Fatalf("migrations applied %d times in total, want %d (advisory lock)", total, len(files))
 	}
 }
 
@@ -461,5 +449,25 @@ func TestPoolMetricsAreExported(t *testing.T) {
 	n, err := testutil.GatherAndCount(reg, "go_sql_open_connections", "airq_db_query_duration_seconds")
 	if err != nil || n != 2 {
 		t.Fatalf("gathered %d series, err %v", n, err)
+	}
+}
+
+func TestOpenLockTimeoutWithoutStatementTimeout(t *testing.T) {
+	admin := os.Getenv("TEST_DATABASE_URL")
+	if admin == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping PostgreSQL integration test")
+	}
+	db, err := Open(Options{URL: admin, MaxOpenConns: 1, ConnMaxLifetime: time.Minute, LockTimeout: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	var stmt, lockT string
+	if err := db.QueryRowContext(context.Background(), `SELECT current_setting('statement_timeout'), current_setting('lock_timeout')`).
+		Scan(&stmt, &lockT); err != nil {
+		t.Fatal(err)
+	}
+	if stmt != "0" || lockT != "10s" {
+		t.Errorf("statement_timeout=%q lock_timeout=%q, want 0 and 10s (migration session)", stmt, lockT)
 	}
 }

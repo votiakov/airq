@@ -1,3 +1,4 @@
+-- +goose Up
 -- Audit log of every request this service sent to a third-party API and what came
 -- back. Written asynchronously and in batches by the response recorder; pruned by the
 -- retention job (DB_RETENTION).
@@ -32,3 +33,6 @@ CREATE INDEX upstream_responses_request_id_idx ON upstream_responses (request_id
 
 -- Incident investigation: recent failures per upstream.
 CREATE INDEX upstream_responses_failures_idx ON upstream_responses (upstream, created_at) WHERE outcome <> 'success';
+
+-- +goose Down
+DROP TABLE IF EXISTS upstream_responses;

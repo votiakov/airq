@@ -9,6 +9,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -117,18 +118,14 @@ func serve(ctx context.Context, getenv func(string) string, stdout io.Writer, on
 		defer func() { _ = db.Close() }()
 		dbMetrics := store.NewMetrics(reg, db)
 
+		if cfg.DB.MigrateOnStart {
+			if err := migrateOnStart(ctx, getenv, logger); err != nil {
+				return fmt.Errorf("migrate on start: %w", err)
+			}
+		}
 		migrator, err := store.NewMigrator(db, migrations.FS, logger)
 		if err != nil {
 			return err
-		}
-		if cfg.DB.MigrateOnStart {
-			mctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-			n, err := migrator.Up(mctx)
-			cancel()
-			if err != nil {
-				return fmt.Errorf("migrate on start: %w", err)
-			}
-			logger.InfoContext(ctx, "migrations applied on start", "count", n)
 		}
 		if err := store.Ping(ctx, db, 3*time.Second); err != nil {
 			// Soft dependency: keep serving; the health report shows "degraded".
@@ -275,22 +272,50 @@ func pprofMux() *http.ServeMux {
 	return mux
 }
 
-// migrate runs schema migrations. MIGRATE_DATABASE_URL lets migrations use a
-// privileged (DDL) role while the service itself runs with a DML-only role.
+// openMigrationDB opens a small pool for schema changes. MIGRATE_DATABASE_URL lets
+// migrations use a privileged (DDL) role while the service itself runs with a
+// DML-only role.
+func openMigrationDB(getenv func(string) string) (*sql.DB, error) {
+	dsn := cmp.Or(getenv("MIGRATE_DATABASE_URL"), getenv("DATABASE_URL"))
+	if dsn == "" {
+		return nil, errors.New("migrate: set MIGRATE_DATABASE_URL or DATABASE_URL")
+	}
+	return store.Open(store.Options{
+		URL: dsn, MaxOpenConns: 2, MaxIdleConns: 1, ConnMaxLifetime: time.Hour, ConnMaxIdleTime: time.Minute,
+		LockTimeout: 10 * time.Second, ApplicationName: "airq-migrate",
+	})
+}
+
+// migrateOnStart applies pending migrations before serving (DB_MIGRATE_ON_START).
+// It suits single-instance setups; elsewhere run `airq migrate up` as a release job.
+func migrateOnStart(ctx context.Context, getenv func(string) string, logger *slog.Logger) error {
+	db, err := openMigrationDB(getenv)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	m, err := store.NewMigrator(db, migrations.FS, logger)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	n, err := m.Up(ctx)
+	if err != nil {
+		return err
+	}
+	logger.InfoContext(ctx, "migrations applied on start", "count", n)
+	return nil
+}
+
+// migrate runs the `airq migrate` subcommand.
 func migrate(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer) error {
-	dsn := getenv("MIGRATE_DATABASE_URL")
-	if dsn == "" {
-		dsn = getenv("DATABASE_URL")
-	}
-	if dsn == "" {
-		return errors.New("migrate: set MIGRATE_DATABASE_URL or DATABASE_URL")
-	}
 	if len(args) == 0 {
 		return errors.New("migrate: expected up, down [N] or status")
 	}
 	logger := telemetry.NewLogger(stdout, slog.LevelInfo, "json")
 
-	db, err := store.Open(store.Options{URL: dsn, MaxOpenConns: 2, MaxIdleConns: 1, ConnMaxLifetime: time.Hour, ConnMaxIdleTime: time.Minute})
+	db, err := openMigrationDB(getenv)
 	if err != nil {
 		return err
 	}

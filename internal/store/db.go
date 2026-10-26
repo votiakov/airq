@@ -6,6 +6,7 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -29,7 +30,11 @@ type Options struct {
 	ConnMaxLifetime  time.Duration
 	ConnMaxIdleTime  time.Duration
 	StatementTimeout time.Duration
-	ApplicationName  string
+	// LockTimeout defaults to StatementTimeout. Migrations set it on its own: no
+	// statement timeout (backfills may be long) but bounded lock waits, so DDL queued
+	// behind a long transaction fails instead of blocking all traffic behind it.
+	LockTimeout     time.Duration
+	ApplicationName string
 }
 
 // Open configures a *sql.DB backed by pgx. It does not connect; use Ping. Server-side
@@ -51,11 +56,13 @@ func Open(opts Options) (*sql.DB, error) {
 	if _, ok := cfg.RuntimeParams["application_name"]; !ok {
 		cfg.RuntimeParams["application_name"] = opts.ApplicationName
 	}
+	ms := func(d time.Duration) string { return strconv.FormatInt(d.Milliseconds(), 10) }
 	if opts.StatementTimeout > 0 {
-		ms := strconv.FormatInt(opts.StatementTimeout.Milliseconds(), 10)
-		cfg.RuntimeParams["statement_timeout"] = ms
-		cfg.RuntimeParams["lock_timeout"] = ms
-		cfg.RuntimeParams["idle_in_transaction_session_timeout"] = strconv.FormatInt(4*opts.StatementTimeout.Milliseconds(), 10)
+		cfg.RuntimeParams["statement_timeout"] = ms(opts.StatementTimeout)
+		cfg.RuntimeParams["idle_in_transaction_session_timeout"] = ms(4 * opts.StatementTimeout)
+	}
+	if lt := cmp.Or(opts.LockTimeout, opts.StatementTimeout); lt > 0 {
+		cfg.RuntimeParams["lock_timeout"] = ms(lt)
 	}
 
 	db := stdlib.OpenDB(*cfg)

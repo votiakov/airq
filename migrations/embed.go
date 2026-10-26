@@ -1,12 +1,16 @@
 // Package migrations embeds the SQL schema migrations so the binary is the single
-// deployable artefact. Files follow golang-migrate naming
-// (NNNNNN_description.up.sql / .down.sql), so the standard migrate CLI can also run
-// them if the team ever prefers it over `airq migrate`.
+// deployable artefact. They run with pressly/goose (`airq migrate`), so the goose CLI
+// can also apply them if ever needed.
 //
-// Rules: migrations are append-only (applied files are checksummed and must never be
-// edited), each runs in its own transaction unless its first line is
-// `-- airq:no-transaction` (needed for CREATE INDEX CONCURRENTLY), and every change
-// must be backwards compatible with the previous release (expand/contract).
+// Rules:
+//   - One file per version, NNNNNN_description.sql, with `-- +goose Up` and
+//     `-- +goose Down` sections.
+//   - Append-only: an applied migration is never edited, renamed or deleted (CI fails
+//     the build if one is); fix forward with a new version.
+//   - Each runs in a transaction unless annotated `-- +goose NO TRANSACTION` (needed
+//     for CREATE INDEX CONCURRENTLY).
+//   - Every change is backwards compatible with the previous release (expand/contract),
+//     so old and new versions can run side by side during a rolling deploy.
 package migrations
 
 import "embed"
