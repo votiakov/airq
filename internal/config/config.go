@@ -66,7 +66,8 @@ type Health struct {
 	Interval time.Duration `env:"INTERVAL" envDefault:"15s"`
 }
 
-// Admin configures the optional private listener used for profiling.
+// Admin configures the optional private listener: the health report with raw
+// errors, and pprof when enabled. Never publish it.
 type Admin struct {
 	Addr         string `env:"ADMIN_ADDR"`    // empty disables the admin listener
 	PprofEnabled bool   `env:"PPROF_ENABLED"` // only honoured when ADMIN_ADDR is set

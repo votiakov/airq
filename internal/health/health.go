@@ -5,7 +5,10 @@
 //     so turns a dependency blip into a restart storm.
 //   - /readyz answers "should the load balancer send traffic here?" It fails while
 //     the process is draining for shutdown or when a critical dependency is down.
-//   - /health returns a per-component report for humans and dashboards.
+//   - /health returns a per-component report for humans and dashboards. It is
+//     public, so failure details are reduced to "timeout" or "unavailable": raw
+//     errors name hosts, users and databases. Full errors are logged when a check
+//     changes state and served by DetailedHealthHandler on the private admin listener.
 //
 // Checks are classified as critical or soft. The vendor API and the database are both
 // soft: cached data can still be served when the vendor is down, and the database
@@ -16,6 +19,9 @@ package health
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
+	"maps"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -51,6 +57,8 @@ type CheckResult struct {
 	Critical   bool    `json:"critical"`
 	Error      string  `json:"error,omitempty"`
 	DurationMS float64 `json:"duration_ms"`
+
+	reason string // what the public report shows instead of Error
 }
 
 // Report is the /health response body.
@@ -65,6 +73,7 @@ type Report struct {
 // Checker runs checks and caches the report briefly so aggressive probing (several
 // load balancers, Kubernetes, dashboards) cannot amplify into dependency load.
 type Checker struct {
+	log      *slog.Logger
 	checks   []Check
 	cacheFor time.Duration
 	started  time.Time
@@ -79,8 +88,9 @@ type Checker struct {
 }
 
 // NewChecker creates a Checker and registers its metrics.
-func NewChecker(reg prometheus.Registerer, cacheFor time.Duration, checks ...Check) *Checker {
+func NewChecker(reg prometheus.Registerer, logger *slog.Logger, cacheFor time.Duration, checks ...Check) *Checker {
 	c := &Checker{
+		log:      logger,
 		checks:   checks,
 		cacheFor: cacheFor,
 		started:  time.Now(),
@@ -136,7 +146,10 @@ func (c *Checker) run(ctx context.Context) Report {
 			res := CheckResult{Status: "ok", Critical: chk.Critical, DurationMS: float64(elapsed.Microseconds()) / 1000}
 			up := 1.0
 			if err != nil {
-				res.Status, res.Error, up = "fail", err.Error(), 0
+				res.Status, res.Error, res.reason, up = "fail", err.Error(), "unavailable", 0
+				if errors.Is(err, context.DeadlineExceeded) {
+					res.reason = "timeout"
+				}
 			}
 			results[i] = res
 			c.status.WithLabelValues(chk.Name, boolLabel(chk.Critical)).Set(up)
@@ -149,6 +162,7 @@ func (c *Checker) run(ctx context.Context) Report {
 	for i, chk := range c.checks {
 		res := results[i]
 		report.Checks[chk.Name] = res
+		c.logTransition(ctx, chk, res)
 		if res.Status == "ok" {
 			continue
 		}
@@ -159,6 +173,33 @@ func (c *Checker) run(ctx context.Context) Report {
 		}
 	}
 	return report
+}
+
+// logTransition logs a check that starts failing (with the full error) or recovers,
+// so operators get the details the public report leaves out, once per change.
+// It runs under c.mu, so c.last is the previous report.
+func (c *Checker) logTransition(ctx context.Context, chk Check, res CheckResult) {
+	prev, seen := c.last.Checks[chk.Name]
+	switch {
+	case res.Status == "fail" && (!seen || prev.Status != "fail"):
+		c.log.WarnContext(ctx, "health check failing",
+			slog.String("check", chk.Name), slog.Bool("critical", chk.Critical), slog.String("error", res.Error))
+	case res.Status == "ok" && seen && prev.Status == "fail":
+		c.log.InfoContext(ctx, "health check recovered", slog.String("check", chk.Name))
+	}
+}
+
+// Redacted returns a copy of r safe to serve publicly: each failing check carries a
+// coarse reason instead of the raw error.
+func (r Report) Redacted() Report {
+	r.Checks = maps.Clone(r.Checks)
+	for name, res := range r.Checks {
+		if res.Error != "" {
+			res.Error = res.reason
+			r.Checks[name] = res
+		}
+	}
+	return r
 }
 
 // Run refreshes the report every interval until ctx is cancelled, so the
@@ -199,15 +240,24 @@ func (c *Checker) ReadinessHandler() http.Handler {
 	})
 }
 
-// HealthHandler serves /health: 200 when ok or degraded, 503 when down.
-func (c *Checker) HealthHandler() http.Handler {
+// HealthHandler serves the public /health report: 200 when ok or degraded, 503 when
+// down. Failure details are redacted.
+func (c *Checker) HealthHandler() http.Handler { return c.healthHandler(Report.Redacted) }
+
+// DetailedHealthHandler serves the same report with raw errors, for the private admin
+// listener only.
+func (c *Checker) DetailedHealthHandler() http.Handler {
+	return c.healthHandler(func(r Report) Report { return r })
+}
+
+func (c *Checker) healthHandler(view func(Report) Report) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rep := c.Report(r.Context())
 		code := http.StatusOK
 		if rep.Status == StatusDown {
 			code = http.StatusServiceUnavailable
 		}
-		writeJSON(w, code, rep)
+		writeJSON(w, code, view(rep))
 	})
 }
 

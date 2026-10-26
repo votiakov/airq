@@ -1,11 +1,14 @@
 package health
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +16,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+var discard = slog.New(slog.DiscardHandler)
 
 func get(t *testing.T, h http.Handler) (int, map[string]any) {
 	t.Helper()
@@ -29,7 +34,7 @@ func get(t *testing.T, h http.Handler) (int, map[string]any) {
 }
 
 func TestAllHealthy(t *testing.T) {
-	c := NewChecker(prometheus.NewRegistry(), 0,
+	c := NewChecker(prometheus.NewRegistry(), discard, 0,
 		Check{Name: "db", Timeout: time.Second, Run: func(context.Context) error { return nil }})
 	code, body := get(t, c.HealthHandler())
 	if code != http.StatusOK || body["status"] != "ok" {
@@ -42,7 +47,7 @@ func TestAllHealthy(t *testing.T) {
 
 func TestSoftFailureDegradesButStaysReady(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	c := NewChecker(reg, 0,
+	c := NewChecker(reg, discard, 0,
 		Check{Name: "database", Timeout: time.Second, Run: func(context.Context) error { return errors.New("connection refused") }},
 		Check{Name: "ok", Timeout: time.Second, Run: func(context.Context) error { return nil }},
 	)
@@ -51,7 +56,7 @@ func TestSoftFailureDegradesButStaysReady(t *testing.T) {
 		t.Fatalf("code=%d body=%v", code, body)
 	}
 	db := body["checks"].(map[string]any)["database"].(map[string]any)
-	if db["status"] != "fail" || db["error"] != "connection refused" {
+	if db["status"] != "fail" || db["error"] != "unavailable" {
 		t.Errorf("database check = %v", db)
 	}
 	if code, _ := get(t, c.ReadinessHandler()); code != http.StatusOK {
@@ -63,7 +68,7 @@ func TestSoftFailureDegradesButStaysReady(t *testing.T) {
 }
 
 func TestCriticalFailureIsDown(t *testing.T) {
-	c := NewChecker(prometheus.NewRegistry(), 0,
+	c := NewChecker(prometheus.NewRegistry(), discard, 0,
 		Check{Name: "core", Critical: true, Timeout: time.Second, Run: func(context.Context) error { return errors.New("broken") }})
 	if code, body := get(t, c.HealthHandler()); code != http.StatusServiceUnavailable || body["status"] != "down" {
 		t.Fatalf("code=%d body=%v", code, body)
@@ -77,7 +82,7 @@ func TestCriticalFailureIsDown(t *testing.T) {
 }
 
 func TestDrainingFailsReadinessOnly(t *testing.T) {
-	c := NewChecker(prometheus.NewRegistry(), 0)
+	c := NewChecker(prometheus.NewRegistry(), discard, 0)
 	c.SetDraining()
 	if !c.Draining() {
 		t.Fatal("Draining() = false")
@@ -95,7 +100,7 @@ func TestDrainingFailsReadinessOnly(t *testing.T) {
 
 func TestChecksAreCachedAndBounded(t *testing.T) {
 	var calls atomic.Int32
-	c := NewChecker(prometheus.NewRegistry(), time.Minute,
+	c := NewChecker(prometheus.NewRegistry(), discard, time.Minute,
 		Check{Name: "slow", Timeout: 20 * time.Millisecond, Run: func(ctx context.Context) error {
 			calls.Add(1)
 			<-ctx.Done()
@@ -115,7 +120,7 @@ func TestChecksAreCachedAndBounded(t *testing.T) {
 
 func TestRunRefreshesInBackground(t *testing.T) {
 	var calls atomic.Int32
-	c := NewChecker(prometheus.NewRegistry(), 0,
+	c := NewChecker(prometheus.NewRegistry(), discard, 0,
 		Check{Name: "c", Timeout: time.Second, Run: func(context.Context) error { calls.Add(1); return nil }})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -125,5 +130,49 @@ func TestRunRefreshesInBackground(t *testing.T) {
 	<-done
 	if calls.Load() < 2 {
 		t.Errorf("background refresh ran %d times", calls.Load())
+	}
+}
+
+func TestPublicReportRedactsErrorsAndLogsTransitions(t *testing.T) {
+	var logs bytes.Buffer
+	var failing atomic.Bool
+	failing.Store(true)
+	c := NewChecker(prometheus.NewRegistry(), slog.New(slog.NewJSONHandler(&logs, nil)), 0,
+		Check{Name: "database", Timeout: time.Second, Run: func(context.Context) error {
+			if failing.Load() {
+				return errors.New("failed to connect to `user=airq_app database=airq`: lookup postgres: no such host")
+			}
+			return nil
+		}},
+		Check{Name: "vendor", Timeout: time.Millisecond, Run: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}},
+	)
+
+	_, public := get(t, c.HealthHandler())
+	checks := public["checks"].(map[string]any)
+	if got := checks["database"].(map[string]any)["error"]; got != "unavailable" {
+		t.Errorf("public database error = %v, want unavailable", got)
+	}
+	if got := checks["vendor"].(map[string]any)["error"]; got != "timeout" {
+		t.Errorf("public vendor error = %v, want timeout", got)
+	}
+	_, detailed := get(t, c.DetailedHealthHandler())
+	if got := detailed["checks"].(map[string]any)["database"].(map[string]any)["error"]; !strings.Contains(got.(string), "airq_app") {
+		t.Errorf("detailed database error = %v, want the raw error", got)
+	}
+
+	get(t, c.HealthHandler()) // still failing: no second log line
+	if n := strings.Count(logs.String(), `"msg":"health check failing","check":"database"`); n != 1 {
+		t.Errorf("logged failing database check %d times, want once per transition:\n%s", n, logs.String())
+	}
+	if !strings.Contains(logs.String(), "airq_app") {
+		t.Error("the full error must be logged")
+	}
+	failing.Store(false)
+	get(t, c.HealthHandler())
+	if !strings.Contains(logs.String(), `"msg":"health check recovered","check":"database"`) {
+		t.Errorf("recovery not logged:\n%s", logs.String())
 	}
 }

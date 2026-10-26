@@ -89,7 +89,7 @@ func newHarness(t *testing.T, svc Service, mutate func(*Options)) *harness {
 	opts := Options{
 		TracerProvider: sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans)),
 		Service:        svc,
-		Health:         health.NewChecker(reg, 0),
+		Health:         health.NewChecker(reg, logger, 0),
 		Registry:       reg,
 		Logger:         logger,
 		Attribution:    "test attribution",

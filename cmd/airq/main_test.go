@@ -7,7 +7,9 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +20,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/votiakov/airq/internal/health"
 	"github.com/votiakov/airq/internal/mockvendor"
 	"github.com/votiakov/airq/internal/store"
 )
@@ -346,5 +351,29 @@ func TestServeExportsTraces(t *testing.T) {
 	defer mu.Unlock()
 	if batches == 0 {
 		t.Fatal("no spans were exported to the OTLP endpoint")
+	}
+}
+
+func TestAdminMuxServesDetailedHealthAndOptionalPprof(t *testing.T) {
+	checker := health.NewChecker(prometheus.NewRegistry(), slog.New(slog.DiscardHandler), 0,
+		health.Check{Name: "database", Timeout: time.Second, Run: func(context.Context) error {
+			return errors.New("dial tcp 10.0.0.5:5432: connection refused")
+		}})
+	for _, pprofEnabled := range []bool{false, true} {
+		mux := adminMux(checker, pprofEnabled)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+		if !strings.Contains(rec.Body.String(), "10.0.0.5:5432") {
+			t.Errorf("admin /health must carry raw errors, got %s", rec.Body)
+		}
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil))
+		want := http.StatusNotFound
+		if pprofEnabled {
+			want = http.StatusOK
+		}
+		if rec.Code != want {
+			t.Errorf("pprof enabled=%v: /debug/pprof/ = %d, want %d", pprofEnabled, rec.Code, want)
+		}
 	}
 }

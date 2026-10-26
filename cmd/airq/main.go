@@ -212,7 +212,7 @@ func serve(ctx context.Context, getenv func(string) string, stdout io.Writer, on
 		GeocodeTTL: cfg.Cache.GeocodeTTL, NotFoundTTL: cfg.Cache.NotFoundTTL, StaleFor: cfg.Cache.StaleFor,
 		FetchTimeout: cfg.HTTP.RequestTimeout, Registerer: reg, Logger: logger,
 	})
-	checker := health.NewChecker(reg, cfg.Health.CacheTTL, checks...)
+	checker := health.NewChecker(reg, logger, cfg.Health.CacheTTL, checks...)
 	initial := checker.Report(ctx)
 	logger.InfoContext(ctx, "initial health", "status", initial.Status, "checks", initial.Checks)
 	background.Go(func() { checker.Run(bgCtx, cfg.Health.Interval) })
@@ -244,10 +244,13 @@ func serve(ctx context.Context, getenv func(string) string, stdout io.Writer, on
 	}
 
 	var admin *http.Server
-	if cfg.Admin.Addr != "" && cfg.Admin.PprofEnabled {
-		admin = &http.Server{Addr: cfg.Admin.Addr, Handler: pprofMux(), ReadHeaderTimeout: 5 * time.Second}
+	if cfg.Admin.Addr != "" {
+		admin = &http.Server{Addr: cfg.Admin.Addr, Handler: adminMux(checker, cfg.Admin.PprofEnabled), ReadHeaderTimeout: 5 * time.Second}
 		go func() { serveErr <- admin.ListenAndServe() }()
-		logger.WarnContext(ctx, "pprof enabled on admin listener; never expose it publicly", "addr", cfg.Admin.Addr)
+		logger.InfoContext(ctx, "admin listener serving the detailed health report", "addr", cfg.Admin.Addr)
+		if cfg.Admin.PprofEnabled {
+			logger.WarnContext(ctx, "pprof enabled on admin listener; never expose it publicly", "addr", cfg.Admin.Addr)
+		}
 	}
 
 	select {
@@ -275,8 +278,14 @@ func serve(ctx context.Context, getenv func(string) string, stdout io.Writer, on
 	return nil
 }
 
-func pprofMux() *http.ServeMux {
+// adminMux serves the private admin listener: the health report with raw errors and,
+// when enabled, pprof.
+func adminMux(checker *health.Checker, pprofEnabled bool) *http.ServeMux {
 	mux := http.NewServeMux()
+	mux.Handle("GET /health", checker.DetailedHealthHandler())
+	if !pprofEnabled {
+		return mux
+	}
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
