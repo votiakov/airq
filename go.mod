@@ -4,7 +4,10 @@ go 1.27.0
 
 toolchain go1.27.3
 
-require github.com/prometheus/client_golang v1.25.0
+require (
+	github.com/prometheus/client_golang v1.25.0
+	golang.org/x/time v0.16.0
+)
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
