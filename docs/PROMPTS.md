@@ -100,6 +100,34 @@ Outcome:
   Makefile, `.env.example`, the README, the architecture, operations and security
   docs, and ADRs 0002–0008.
 
+## 6. Independent review of the vendor integration
+
+> Run an independent agent reviewing all the patterns you implement around the calls to
+> the third party, response to the user. Create criteria and rate them /10
+
+Outcome:
+- **Reviewer.** A separate agent read the code and tests cold, before any docs, and
+  wrote its own 14 criteria. It scored the integration 6.8/10 on average (7.0
+  holistic), with no critical findings.
+- **Proofs.** Its proofs ran as throwaway `go test -overlay` tests, outside the
+  repository. The main agent re-ran them and they reproduced.
+- **High findings:**
+  - vendor 401/403/404/410 skip both stale fallback and the circuit breaker;
+  - a panic inside a coalesced (singleflight) fetch crashes the process.
+- **Medium findings:**
+  - an unbounded `Retry-After`;
+  - empty 200 payloads cached as good data;
+  - `Age` double-counted against `max-age`;
+  - quota fairness;
+  - the proxy-trust default;
+  - the breaker's consecutive-only counting.
+- **Docs.** It also found the docs claiming "full jitter" where the code uses ±50%
+  randomisation.
+
+The report is kept verbatim in
+[`docs/reviews/2026-10-26-vendor-integration-review.md`](reviews/2026-10-26-vendor-integration-review.md).
+Fixes were held back for the user's go-ahead.
+
 ## How the agent worked through it
 
 1. **Research before code.** Checked the toolchain (Go 1.22 locally, so the agent pulled
