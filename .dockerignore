@@ -1,0 +1,9 @@
+# Allow-list: only what the build needs reaches the daemon, so local files (.env,
+# editor state, build output) can never leak into an image layer.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/
+!migrations/
+**/*_test.go
