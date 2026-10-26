@@ -1,0 +1,351 @@
+# Continuous integration and delivery.
+#
+#   lint        golangci-lint, go mod tidy, shellcheck, actionlint
+#   test        unit + PostgreSQL integration tests with the race detector, coverage
+#   build       cross-compiles every supported GOOS/GOARCH
+#   vuln        govulncheck (reachable Go vulnerabilities only)
+#   scan-repo   Trivy: dependency CVEs, leaked secrets, Dockerfile/compose misconfig
+#   ops-config  promtool config check + alert unit tests, compose and dashboard validation
+#   migrations  pull requests may only add migration files, never edit applied ones
+#   image       builds the image, Trivy-scans it, runs the e2e smoke test on compose
+#   publish     main and tags: multi-arch push to GHCR with SBOM, provenance, cosign
+#
+# Every third-party action is pinned to a full commit SHA (Dependabot bumps them).
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * 1" # weekly: catch newly disclosed CVEs in unchanged code
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GOLANGCI_LINT_VERSION: v2.15.0
+  ACTIONLINT_VERSION: v1.7.12
+  TRIVY_VERSION: v0.76.1
+  PROMETHEUS_IMAGE: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy -diff
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+      - name: shellcheck
+        run: shellcheck scripts/*.sh deploy/postgres/initdb/*.sh
+      - name: actionlint
+        run: go run "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Test (race detector, shuffled, with PostgreSQL)
+        run: go test -race -shuffle=on -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+      - name: Integration tests ran (not skipped)
+        run: |
+          if go test -count=1 -v ./internal/store/ ./cmd/airq/ | grep -- '--- SKIP'; then
+            echo "::error::PostgreSQL integration tests were skipped"
+            exit 1
+          fi
+      - name: Coverage summary
+        run: |
+          {
+            echo '### Coverage'
+            echo '```'
+            go tool cover -func=coverage.out | tail -1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 14
+
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Cross-compile
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64; do
+            echo "::group::$target"
+            GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath -o /dev/null ./...
+            echo "::endgroup::"
+          done
+
+  vuln:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        with:
+          go-version-file: go.mod
+          go-package: ./...
+
+  scan-repo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write # upload SARIF to code scanning
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Trivy (report all findings to code scanning)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy-repo.sarif
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always()
+        with:
+          sarif_file: trivy-repo.sarif
+          category: trivy-repo
+      - name: Trivy (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  ops-config:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prometheus config and rules are valid
+        run: >-
+          docker run --rm -v "$PWD/deploy/prometheus:/etc/prometheus:ro"
+          --entrypoint promtool "$PROMETHEUS_IMAGE"
+          check config /etc/prometheus/prometheus.yml
+      - name: Alert and recording rule unit tests
+        run: >-
+          docker run --rm -v "$PWD/deploy/prometheus:/etc/prometheus:ro" -w /etc/prometheus
+          --entrypoint promtool "$PROMETHEUS_IMAGE"
+          test rules tests/airq.rules.test.yml
+      - name: Compose files are valid
+        run: |
+          docker compose -f compose.yaml config --quiet
+          docker compose -f compose.yaml -f compose.mock.yaml config --quiet
+      - name: Grafana dashboards are valid JSON with stable UIDs
+        run: |
+          for f in deploy/grafana/dashboards/*.json; do
+            jq -e '.uid and .title and (.panels | length > 0)' "$f" >/dev/null || { echo "::error file=$f::invalid dashboard"; exit 1; }
+          done
+      - name: Every alert links to an existing runbook section
+        run: |
+          missing=0
+          for anchor in $(grep -ho 'OPERATIONS.md#[a-z0-9-]*' deploy/prometheus/rules/*.yml | sort -u | cut -d'#' -f2); do
+            # GitHub anchors are the lower-cased heading with spaces turned into dashes.
+            if ! grep -iqE "^#+ +${anchor}\$" docs/OPERATIONS.md; then
+              echo "::error file=docs/OPERATIONS.md::missing runbook heading for #${anchor}"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+  migrations:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Applied migrations are immutable; new ones sort last
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # goose keeps no checksums, so editing an applied migration would silently
+          # diverge environments. Only additions are allowed.
+          changed=$(git diff --name-status --no-renames "$BASE_SHA"...HEAD -- 'migrations/*.sql' | awk '$1 != "A"')
+          if [ -n "$changed" ]; then
+            echo "::error::existing migrations must not be modified or deleted; add a new migration instead:"
+            echo "$changed"
+            exit 1
+          fi
+          latest=$(git ls-tree --name-only "$BASE_SHA" migrations/ | grep -oE '[0-9]{6}_' | sort | tail -1)
+          for f in $(git diff --name-only --diff-filter=A "$BASE_SHA"...HEAD -- 'migrations/*.sql'); do
+            base=$(basename "$f")
+            [[ $base =~ ^[0-9]{6}_[a-z0-9_]+\.sql$ ]] || { echo "::error file=$f::name must be NNNNNN_snake_case.sql"; exit 1; }
+            [[ ${base:0:7} > ${latest:-000000_} ]] || { echo "::error file=$f::version must be greater than ${latest%_}"; exit 1; }
+          done
+
+  image:
+    needs: [lint, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          load: true
+          tags: airq:local
+          build-args: |
+            VERSION=ci
+            REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Trivy image scan (report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: image
+          image-ref: airq:local
+          format: sarif
+          output: trivy-image.sarif
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always()
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+      - name: Trivy image scan (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
+          scan-type: image
+          image-ref: airq:local
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Image runs as non-root and reports its version
+        run: |
+          [ "$(docker image inspect -f '{{.Config.User}}' airq:local)" = "nonroot:nonroot" ]
+          docker run --rm airq:local version | jq -e --arg sha "$GITHUB_SHA" '.revision == $sha'
+      - name: Start the stack (mock vendor)
+        run: docker compose -f compose.yaml -f compose.mock.yaml up -d --wait --wait-timeout 180 airq prometheus
+      - name: Smoke test
+        env:
+          SMOKE_STOP: "1"
+        run: scripts/smoke.sh
+      - name: Container logs
+        if: failure()
+        run: docker compose -f compose.yaml -f compose.mock.yaml logs --no-color --timestamps
+      - name: Tear down
+        if: always()
+        run: docker compose -f compose.yaml -f compose.mock.yaml down -v
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [lint, test, build, vuln, scan-repo, ops-config, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # keyless cosign signing via OIDC
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+            REVISION=${{ github.sha }}
+            BUILD_TIME=${{ github.event.head_commit.timestamp }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign the image (keyless, by digest)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: cosign sign --yes "${IMAGE,,}@${DIGEST}" # registry paths must be lower-case
