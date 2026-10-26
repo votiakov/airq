@@ -45,6 +45,28 @@ the work was split up.
 
 > Correction - use Open-Meteo API as it does not need an api key
 
+## 3. Correction: don't reinvent the wheel
+
+> Correction: "few dependencies and use go standard lib" does not mean reinventing the
+> wheel for everything... Use best practice libraries where makes sense. Give me the
+> full list of everything that was reinvented and what was used from existing lib -
+> each which explanation why this decision was made.
+
+Outcome: the circuit breaker, backoff/retry loop, channel semaphores, LRU, env loader,
+migration runner, W3C trace-context code and ETag matcher were replaced. Their
+replacements are gobreaker, backoff/v5, x/sync/semaphore, golang-lru, caarlos0/env,
+goose, OpenTelemetry and `http.ServeContent`, each in its own `refactor:` or `feat:`
+commit. The full built-vs-borrowed inventory, with the reason for every entry, is
+[ADR 0001](adr/0001-dependency-policy.md).
+
+## 4. Acceptance plan
+
+> run parallel agent (sonnet) to create a full testing/acceptance plan for the build. do
+> not run it yet - plan it and show it to me for approval
+
+Outcome: a Sonnet subagent drafted the plan (read-only, in parallel with the refactor)
+for approval before anything was executed.
+
 ## How the agent worked through it
 
 1. **Research before code.** Checked the toolchain (Go 1.22 locally, so the agent pulled
