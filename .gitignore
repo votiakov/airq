@@ -1,0 +1,21 @@
+# Binaries and build output
+/bin/
+/dist/
+*.exe
+*.test
+
+# Test artefacts
+*.out
+coverage.*
+!coverage.go
+
+# Local environment (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
