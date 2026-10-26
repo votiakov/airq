@@ -55,7 +55,7 @@ type Recorder struct {
 	queries *Metrics
 	log     *slog.Logger
 	tracer  trace.Tracer
-	queue   chan upstream.Exchange
+	queue   chan queued
 
 	records   *prometheus.CounterVec
 	batchSize prometheus.Histogram
@@ -83,7 +83,7 @@ func NewRecorder(db *sql.DB, queries *Metrics, opts RecorderOptions) *Recorder {
 		queries: queries,
 		log:     opts.Logger.With(slog.String("component", "recorder")),
 		tracer:  opts.TracerProvider.Tracer(tracerName),
-		queue:   make(chan upstream.Exchange, max(opts.Buffer, 1)),
+		queue:   make(chan queued, max(opts.Buffer, 1)),
 		records: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: telemetry.Namespace, Subsystem: "recorder", Name: "records_total",
 			Help: "Upstream exchanges handled by the DB recorder: written, dropped (queue full) or failed (insert error).",
@@ -110,10 +110,25 @@ func NewRecorder(db *sql.DB, queries *Metrics, opts RecorderOptions) *Recorder {
 	return r
 }
 
+// queued is an exchange waiting to be written. Oversized bodies are dropped before
+// queueing and small ones copied exactly, so a stalled database holds at most
+// Buffer × MaxBodyBytes of response bodies rather than Buffer × the vendor's
+// response cap (1 MiB by default).
+type queued struct {
+	upstream.Exchange
+	bodyBytes int // size of the original response body
+}
+
 // Record enqueues ex without blocking.
 func (r *Recorder) Record(ex upstream.Exchange) {
+	q := queued{Exchange: ex, bodyBytes: len(ex.Body)}
+	if len(ex.Body) > r.opts.MaxBodyBytes {
+		q.Body = nil
+	} else {
+		q.Body = bytes.Clone(ex.Body) // detach from io.ReadAll's larger backing array
+	}
 	select {
-	case r.queue <- ex:
+	case r.queue <- q:
 	default:
 		r.records.WithLabelValues("dropped").Inc()
 		r.throttledError("recorder queue full; dropping upstream exchange", nil)
@@ -125,7 +140,7 @@ func (r *Recorder) Record(ex upstream.Exchange) {
 func (r *Recorder) Run(ctx context.Context, drainTimeout time.Duration) {
 	ticker := time.NewTicker(r.opts.FlushInterval)
 	defer ticker.Stop()
-	batch := make([]upstream.Exchange, 0, r.opts.BatchSize)
+	batch := make([]queued, 0, r.opts.BatchSize)
 	flush := func(ctx context.Context) {
 		if len(batch) > 0 {
 			r.write(ctx, batch)
@@ -161,7 +176,7 @@ func (r *Recorder) Run(ctx context.Context, drainTimeout time.Duration) {
 	}
 }
 
-func (r *Recorder) write(ctx context.Context, batch []upstream.Exchange) {
+func (r *Recorder) write(ctx context.Context, batch []queued) {
 	rows := make([][]any, len(batch))
 	links := make([]trace.Link, 0, len(batch))
 	for i, ex := range batch {
@@ -237,7 +252,7 @@ func (r *Recorder) insert(ctx context.Context, rows [][]any) error {
 // row converts an exchange to column values, sanitising anything PostgreSQL would
 // reject (NUL bytes in text, \u0000 in jsonb, invalid JSON) so one odd response can
 // never fail a batch.
-func (r *Recorder) row(ex upstream.Exchange) []any {
+func (r *Recorder) row(ex queued) []any {
 	query, err := json.Marshal(ex.Query)
 	if err != nil || ex.Query == nil {
 		query = []byte("{}")
@@ -245,9 +260,9 @@ func (r *Recorder) row(ex upstream.Exchange) []any {
 	var body any // NULL unless a usable JSON document
 	truncated := false
 	switch {
-	case len(ex.Body) == 0:
-	case len(ex.Body) > r.opts.MaxBodyBytes:
+	case ex.bodyBytes > r.opts.MaxBodyBytes:
 		truncated = true
+	case len(ex.Body) == 0:
 	case json.Valid(ex.Body) && !bytes.Contains(ex.Body, []byte(`\u0000`)):
 		body = string(ex.Body)
 	}
@@ -269,7 +284,7 @@ func (r *Recorder) row(ex upstream.Exchange) []any {
 		status,
 		clean(ex.Outcome),
 		float64(ex.Duration.Microseconds()) / 1000,
-		len(ex.Body),
+		ex.bodyBytes,
 		body,
 		truncated,
 		nullable(clean(errMsg)),
