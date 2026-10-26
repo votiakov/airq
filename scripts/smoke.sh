@@ -5,7 +5,8 @@
 #   scripts/smoke.sh
 #
 # Run by CI (job "e2e") and by `make smoke`. Needs curl and jq. Exits non-zero on the
-# first failed check. SMOKE_STOP=1 also checks that airq stops cleanly on SIGTERM
+# first failed check. SMOKE_GRAFANA=1 also checks the provisioned dashboard and
+# datasources (start the grafana service too). SMOKE_STOP=1 also checks that airq stops cleanly on SIGTERM
 # (this leaves the airq container stopped).
 set -euo pipefail
 
@@ -13,6 +14,7 @@ AIRQ=${AIRQ_URL:-http://localhost:${AIRQ_PORT:-8080}}
 MOCK=${MOCK_URL:-http://localhost:${MOCK_PORT:-8090}}
 PROM=${PROMETHEUS_URL:-http://localhost:${PROMETHEUS_PORT:-9090}}
 JAEGER=${JAEGER_URL:-http://localhost:${JAEGER_PORT:-16686}}
+GRAFANA=${GRAFANA_URL:-http://localhost:${GRAFANA_PORT:-3000}}
 read -r -a COMPOSE <<<"${COMPOSE:-docker compose -f compose.yaml -f compose.mock.yaml}"
 
 ok() { printf '  ok    %s\n' "$*"; }
@@ -151,6 +153,20 @@ section "Tracing"
 eventually 30 bash -c "curl -fsS '$JAEGER/api/v3/services' | jq -e '.services | index(\"airq\")'" ||
   fail "no airq traces in Jaeger"
 ok "traces exported to Jaeger"
+
+if [[ ${SMOKE_GRAFANA:-0} == 1 ]]; then
+  section "Grafana"
+  eventually 90 curl -fsS "$GRAFANA/api/health" || fail "Grafana is not up"
+  panels=$(curl -fsS "$GRAFANA/api/dashboards/uid/airq-overview" | jq '.dashboard.panels | length')
+  ((panels > 0)) || fail "airq overview dashboard not provisioned"
+  ok "dashboard provisioned with $panels panels (anonymous viewer)"
+  curl -fsS "$GRAFANA/api/datasources/proxy/uid/prometheus/api/v1/query?query=airq_build_info" |
+    jq -e '.data.result | length > 0' >/dev/null || fail "Grafana cannot query Prometheus"
+  ok "Grafana queries Prometheus"
+  curl -fsS "$GRAFANA/api/datasources/proxy/uid/jaeger/api/v3/services" |
+    jq -e '.services | index("airq")' >/dev/null || fail "Grafana cannot query Jaeger"
+  ok "Grafana queries Jaeger"
+fi
 
 if [[ ${SMOKE_STOP:-0} == 1 ]]; then
   section "Graceful shutdown"

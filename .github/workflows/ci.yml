@@ -283,10 +283,11 @@ jobs:
         run: |
           [ "$(docker image inspect -f '{{.Config.User}}' airq:local)" = "nonroot:nonroot" ]
           docker run --rm airq:local version | jq -e --arg sha "$GITHUB_SHA" '.revision == $sha'
-      - name: Start the stack (mock vendor)
-        run: docker compose -f compose.yaml -f compose.mock.yaml up -d --wait --wait-timeout 180 airq prometheus
+      - name: Start the full stack (mock vendor)
+        run: docker compose -f compose.yaml -f compose.mock.yaml up -d --wait --wait-timeout 240 airq prometheus grafana
       - name: Smoke test
         env:
+          SMOKE_GRAFANA: "1"
           SMOKE_STOP: "1"
         run: scripts/smoke.sh
       - name: Container logs
