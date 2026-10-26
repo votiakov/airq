@@ -578,6 +578,30 @@ func TestIndexAndOperationalEndpoints(t *testing.T) {
 	}
 }
 
+func TestAccessLogRedactsUnknownQueryParameters(t *testing.T) {
+	h := newHarness(t, okService(), nil)
+	h.do(t, http.MethodGet, "/v1/air-quality/current?lat=1&lon=2&apikey=s3cr3t-key&token=s3cr3t-token", nil)
+	logs := h.logs.String()
+	if strings.Contains(logs, "s3cr3t") {
+		t.Fatalf("secret leaked into logs: %s", logs)
+	}
+	if !strings.Contains(logs, `"query":"apikey=REDACTED&lat=1&lon=2&token=REDACTED"`) {
+		t.Errorf("access log query not redacted as expected: %s", logs)
+	}
+
+	for raw, want := range map[string]string{
+		"":               "",
+		"location=Paris": "location=Paris",
+		"key=a&key=b":    "key=REDACTED&key=REDACTED",
+		"lat=1;secret=x": "[unparseable]",
+		"bad=%zz&lat=1":  "[unparseable]",
+	} {
+		if got := redactQuery(raw); got != want {
+			t.Errorf("redactQuery(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
 func TestClientIP(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	r.RemoteAddr = "10.0.0.1:5555"

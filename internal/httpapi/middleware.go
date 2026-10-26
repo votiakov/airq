@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -138,7 +139,7 @@ func observe(mux *http.ServeMux, m *metrics, log *slog.Logger, trustProxy bool, 
 			slog.String("method", r.Method),
 			slog.String("route", route),
 			slog.String("path", truncate(r.URL.Path, 256)),
-			slog.String("query", truncate(r.URL.RawQuery, 256)),
+			slog.String("query", redactQuery(r.URL.RawQuery)),
 			slog.Int("status", status),
 			slog.Float64("duration_ms", float64(elapsed.Microseconds())/1000),
 			slog.Int64("bytes", rec.bytes),
@@ -338,6 +339,30 @@ func withTimeout(d time.Duration, next http.Handler) http.Handler {
 		defer cancel()
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// loggedQueryParams are the query parameters the API accepts. Only their values reach
+// the access log: anything else a client sends (say, an API key pasted into the wrong
+// URL) is logged by name with its value redacted.
+var loggedQueryParams = map[string]bool{"location": true, "country": true, "lat": true, "lon": true, "hours": true}
+
+// redactQuery prepares a raw query string for the access log.
+func redactQuery(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	q, err := url.ParseQuery(raw)
+	if err != nil {
+		return "[unparseable]" // never log what we could not inspect
+	}
+	for k, vs := range q {
+		if !loggedQueryParams[k] {
+			for i := range vs {
+				vs[i] = "REDACTED"
+			}
+		}
+	}
+	return truncate(q.Encode(), 256)
 }
 
 func truncate(s string, n int) string {
