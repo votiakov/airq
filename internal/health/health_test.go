@@ -112,3 +112,18 @@ func TestChecksAreCachedAndBounded(t *testing.T) {
 		t.Error("check timeout was not enforced")
 	}
 }
+
+func TestRunRefreshesInBackground(t *testing.T) {
+	var calls atomic.Int32
+	c := NewChecker(prometheus.NewRegistry(), 0,
+		Check{Name: "c", Timeout: time.Second, Run: func(context.Context) error { calls.Add(1); return nil }})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { c.Run(ctx, 5*time.Millisecond); close(done) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+	if calls.Load() < 2 {
+		t.Errorf("background refresh ran %d times", calls.Load())
+	}
+}

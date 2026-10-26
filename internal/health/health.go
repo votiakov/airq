@@ -161,6 +161,22 @@ func (c *Checker) run(ctx context.Context) Report {
 	return report
 }
 
+// Run refreshes the report every interval until ctx is cancelled, so the
+// health_check_up metrics (and alerts built on them) stay current even when nothing
+// is probing /health.
+func (c *Checker) Run(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.Report(ctx)
+		}
+	}
+}
+
 // LivenessHandler serves /livez.
 func (c *Checker) LivenessHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

@@ -20,6 +20,7 @@ import (
 type Config struct {
 	Log      Log
 	HTTP     HTTP
+	Health   Health
 	Admin    Admin
 	Upstream Upstream
 	Cache    Cache
@@ -51,6 +52,15 @@ type HTTP struct {
 	RateLimitRPS      float64
 	RateLimitBurst    int
 	TrustProxyHeaders bool
+}
+
+// Health configures dependency checks.
+type Health struct {
+	// CacheTTL bounds how often checks hit dependencies, however often /health and
+	// /readyz are probed.
+	CacheTTL time.Duration
+	// Interval is how often checks run in the background to keep metrics current.
+	Interval time.Duration
 }
 
 // Admin configures the optional private listener used for profiling.
@@ -130,6 +140,11 @@ func Load(getenv func(string) string) (Config, error) {
 		TrustProxyHeaders: l.boolean("HTTP_TRUST_PROXY_HEADERS", false),
 	}
 
+	cfg.Health = Health{
+		CacheTTL: l.duration("HEALTH_CACHE_TTL", 2*time.Second),
+		Interval: l.duration("HEALTH_INTERVAL", 15*time.Second),
+	}
+
 	cfg.Admin = Admin{
 		Addr:         l.str("ADMIN_ADDR", ""),
 		PprofEnabled: l.boolean("PPROF_ENABLED", false),
@@ -203,6 +218,9 @@ func (c *Config) validate(l *loader) {
 	l.check(h.MaxInFlight >= 1, "HTTP_MAX_IN_FLIGHT must be at least 1")
 	l.check(h.RateLimitRPS > 0, "HTTP_RATE_LIMIT_RPS must be positive")
 	l.check(h.RateLimitBurst >= 1, "HTTP_RATE_LIMIT_BURST must be at least 1")
+
+	l.check(c.Health.CacheTTL >= 0, "HEALTH_CACHE_TTL must not be negative")
+	l.positive("HEALTH_INTERVAL", c.Health.Interval)
 
 	u := c.Upstream
 	l.baseURL("UPSTREAM_AIR_QUALITY_URL", u.AirQualityURL)
