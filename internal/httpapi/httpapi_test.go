@@ -183,6 +183,17 @@ func TestCurrentByCoordinates(t *testing.T) {
 	if rec2.Code != http.StatusNotModified || rec2.Body.Len() != 0 {
 		t.Errorf("conditional GET = %d with %d bytes", rec2.Code, rec2.Body.Len())
 	}
+	if rec2.Header().Get("ETag") != hdr.Get("ETag") || rec2.Header().Get("Cache-Control") == "" {
+		t.Errorf("304 must keep validators and caching headers: %v", rec2.Header())
+	}
+	if rec3 := h.do(t, http.MethodGet, "/v1/air-quality/current?lat=52.52&lon=13.41",
+		map[string]string{"If-None-Match": `"other"`}); rec3.Code != http.StatusOK || rec3.Body.Len() == 0 {
+		t.Errorf("non-matching validator = %d with %d bytes", rec3.Code, rec3.Body.Len())
+	}
+	head := h.do(t, http.MethodHead, "/v1/air-quality/current?lat=52.52&lon=13.41", nil)
+	if head.Code != http.StatusOK || head.Body.Len() != 0 || head.Header().Get("Content-Length") == "" {
+		t.Errorf("HEAD = %d, %d body bytes, Content-Length %q", head.Code, head.Body.Len(), head.Header().Get("Content-Length"))
+	}
 }
 
 func TestCurrentByLocationPathAndQuery(t *testing.T) {

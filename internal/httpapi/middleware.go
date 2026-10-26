@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/semaphore"
 	"golang.org/x/time/rate"
 
 	"github.com/votiakov/airq/internal/cache"
@@ -241,25 +242,24 @@ func securityHeaders(next http.Handler) http.Handler {
 // with 503 rather than queueing, keeping latency bounded for admitted requests and
 // letting the load balancer retry elsewhere.
 type loadShedder struct {
-	sem chan struct{}
+	sem *semaphore.Weighted
 	m   *metrics
 }
 
 func newLoadShedder(maxInFlight int, m *metrics) *loadShedder {
-	return &loadShedder{sem: make(chan struct{}, maxInFlight), m: m}
+	return &loadShedder{sem: semaphore.NewWeighted(int64(maxInFlight)), m: m}
 }
 
 func (s *loadShedder) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case s.sem <- struct{}{}:
-			defer func() { <-s.sem }()
-			next.ServeHTTP(w, r)
-		default:
+		if !s.sem.TryAcquire(1) {
 			s.m.rejected.WithLabelValues("overloaded").Inc()
 			w.Header().Set("Retry-After", "1")
 			writeProblem(w, r, http.StatusServiceUnavailable, "overloaded", "The service is at capacity; retry shortly.")
+			return
 		}
+		defer s.sem.Release(1)
+		next.ServeHTTP(w, r)
 	})
 }
 

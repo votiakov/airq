@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -202,22 +203,9 @@ func writeResult(w http.ResponseWriter, r *http.Request, body any, status airqua
 		h.Set("Cache-Status", fmt.Sprintf("airq; hit; ttl=%d", int(ttl.Seconds())))
 	}
 
-	if etagMatches(r.Header.Get("If-None-Match"), etag) {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(buf)
-}
-
-func etagMatches(header, etag string) bool {
-	for candidate := range strings.SplitSeq(header, ",") {
-		c := strings.TrimPrefix(strings.TrimSpace(candidate), "W/")
-		if c == etag || c == "*" {
-			return true
-		}
-	}
-	return false
+	// ServeContent evaluates If-None-Match against the ETag above (RFC 9110 weak
+	// comparison, answering 304) and handles HEAD and Range requests.
+	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(buf))
 }
 
 // target is a validated query subject: either coordinates or a place name.
