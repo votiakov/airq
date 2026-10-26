@@ -11,13 +11,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// panickingProvider panics in Current, as a nil dereference in an adapter would.
+// panickingProvider panics in Current, as a bug in an adapter would.
 type panickingProvider struct{ fakeProvider }
 
 func (*panickingProvider) Current(context.Context, Coordinates) (Current, error) {
-	var m map[string]int
-	m["boom"] = 1 //nolint:govet // the nil-map panic is the point of this test
-	return Current{}, nil
+	panic("boom")
 }
 
 func TestPanicInSharedFetchIsRecoveredAndCounted(t *testing.T) {
