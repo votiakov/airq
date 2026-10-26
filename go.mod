@@ -6,6 +6,7 @@ toolchain go1.27.3
 
 require (
 	github.com/cenkalti/backoff/v5 v5.0.3
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/sony/gobreaker/v2 v2.4.0

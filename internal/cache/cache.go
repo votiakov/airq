@@ -1,14 +1,19 @@
-// Package cache implements a bounded, in-memory LRU cache with per-entry TTLs and a
-// stale window that enables stale-if-error serving (RFC 5861 semantics): an entry past
-// its TTL is no longer served by default, but is kept for StaleFor so it can be
-// returned when the upstream is failing.
+// Package cache adds freshness policy on top of an LRU: per-entry TTLs and a stale
+// window that enables stale-if-error serving (RFC 5861 semantics). An entry past its
+// TTL is no longer served by default, but is kept for StaleFor so it can be returned
+// when the upstream is failing.
+//
+// Recency tracking and capacity eviction come from hashicorp/golang-lru's simplelru.
+// The non-thread-safe variant is used deliberately: expiry is lazy, and the
+// "look up, find it expired, remove it" sequence must be atomic so a concurrent Set
+// of a fresh value is never removed by mistake. One mutex here covers that.
 package cache
 
 import (
-	"container/list"
 	"sync"
 	"time"
 
+	"github.com/hashicorp/golang-lru/v2/simplelru"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/votiakov/airq/internal/telemetry"
@@ -45,38 +50,27 @@ type Options struct {
 // Cache is safe for concurrent use.
 type Cache[K comparable, V any] struct {
 	name    string
-	max     int
 	now     func() time.Time
 	metrics *Metrics
 
-	mu    sync.Mutex
-	items map[K]*list.Element
-	lru   *list.List // front = most recently used
+	mu  sync.Mutex
+	lru *simplelru.LRU[K, item[V]]
 }
 
-type item[K comparable, V any] struct {
-	key        K
+type item[V any] struct {
 	entry      Entry[V]
 	staleUntil time.Time
 }
 
 // New creates a cache.
 func New[K comparable, V any](opts Options) *Cache[K, V] {
-	if opts.MaxEntries < 1 {
-		opts.MaxEntries = 1
-	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	// NewLRU only fails for a non-positive size.
+	lru, _ := simplelru.NewLRU[K, item[V]](max(opts.MaxEntries, 1), nil)
 	opts.Metrics.init(opts.Name)
-	return &Cache[K, V]{
-		name:    opts.Name,
-		max:     opts.MaxEntries,
-		now:     opts.Now,
-		metrics: opts.Metrics,
-		items:   make(map[K]*list.Element),
-		lru:     list.New(),
-	}
+	return &Cache[K, V]{name: opts.Name, now: opts.Now, metrics: opts.Metrics, lru: lru}
 }
 
 // Get looks key up. It returns ok=false on a miss. A found entry may be stale (check
@@ -84,58 +78,40 @@ func New[K comparable, V any](opts Options) *Cache[K, V] {
 func (c *Cache[K, V]) Get(key K) (Entry[V], bool) {
 	now := c.now()
 	c.mu.Lock()
-	el, found := c.items[key]
-	if !found {
-		c.mu.Unlock()
-		c.metrics.lookup(c.name, "miss")
-		return Entry[V]{}, false
-	}
-	it := el.Value.(*item[K, V])
-	if !now.Before(it.staleUntil) {
-		c.removeLocked(el)
-		n := len(c.items)
+	it, found := c.lru.Get(key)
+	if found && !now.Before(it.staleUntil) {
+		c.lru.Remove(key)
+		n := c.lru.Len()
 		c.mu.Unlock()
 		c.metrics.evicted(c.name, "expired", n)
 		c.metrics.lookup(c.name, "miss")
 		return Entry[V]{}, false
 	}
-	c.lru.MoveToFront(el)
-	e := it.entry
 	c.mu.Unlock()
 
-	if e.Fresh(now) {
+	switch {
+	case !found:
+		c.metrics.lookup(c.name, "miss")
+		return Entry[V]{}, false
+	case it.entry.Fresh(now):
 		c.metrics.lookup(c.name, "hit")
-	} else {
+	default:
 		c.metrics.lookup(c.name, "stale")
 	}
-	return e, true
+	return it.entry, true
 }
 
 // Set stores value for ttl, keeping it for an additional staleFor as a fallback.
 func (c *Cache[K, V]) Set(key K, value V, ttl, staleFor time.Duration) Entry[V] {
 	now := c.now()
 	e := Entry[V]{Value: value, StoredAt: now, ExpiresAt: now.Add(ttl)}
-	it := &item[K, V]{key: key, entry: e, staleUntil: e.ExpiresAt.Add(max(staleFor, 0))}
 
 	c.mu.Lock()
-	if el, ok := c.items[key]; ok {
-		el.Value = it
-		c.lru.MoveToFront(el)
-		n := len(c.items)
-		c.mu.Unlock()
-		c.metrics.size(c.name, n)
-		return e
-	}
-	c.items[key] = c.lru.PushFront(it)
-	evicted := 0
-	for len(c.items) > c.max {
-		c.removeLocked(c.lru.Back())
-		evicted++
-	}
-	n := len(c.items)
+	evicted := c.lru.Add(key, item[V]{entry: e, staleUntil: e.ExpiresAt.Add(max(staleFor, 0))})
+	n := c.lru.Len()
 	c.mu.Unlock()
 
-	for range evicted {
+	if evicted {
 		c.metrics.evicted(c.name, "capacity", n)
 	}
 	c.metrics.size(c.name, n)
@@ -145,10 +121,8 @@ func (c *Cache[K, V]) Set(key K, value V, ttl, staleFor time.Duration) Entry[V] 
 // Delete removes key.
 func (c *Cache[K, V]) Delete(key K) {
 	c.mu.Lock()
-	if el, ok := c.items[key]; ok {
-		c.removeLocked(el)
-	}
-	n := len(c.items)
+	c.lru.Remove(key)
+	n := c.lru.Len()
 	c.mu.Unlock()
 	c.metrics.size(c.name, n)
 }
@@ -157,17 +131,11 @@ func (c *Cache[K, V]) Delete(key K) {
 func (c *Cache[K, V]) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return len(c.items)
+	return c.lru.Len()
 }
 
 // MarkStaleServed records that a stale entry was served because the origin failed.
 func (c *Cache[K, V]) MarkStaleServed() { c.metrics.staleServed(c.name) }
-
-func (c *Cache[K, V]) removeLocked(el *list.Element) {
-	it := el.Value.(*item[K, V])
-	delete(c.items, it.key)
-	c.lru.Remove(el)
-}
 
 // Metrics are shared by all caches and distinguished by the "cache" label.
 type Metrics struct {
