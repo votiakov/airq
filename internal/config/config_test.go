@@ -8,12 +8,12 @@ import (
 	"time"
 )
 
-func env(m map[string]string) func(string) string {
+func envFrom(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
 
 func TestLoadDefaults(t *testing.T) {
-	cfg, err := Load(env(nil))
+	cfg, err := Load(envFrom(nil))
 	if err != nil {
 		t.Fatalf("Load with empty env: %v", err)
 	}
@@ -35,7 +35,7 @@ func TestLoadDefaults(t *testing.T) {
 }
 
 func TestLoadOverrides(t *testing.T) {
-	cfg, err := Load(env(map[string]string{
+	cfg, err := Load(envFrom(map[string]string{
 		"LOG_LEVEL":                "debug",
 		"LOG_FORMAT":               "text",
 		"HTTP_ADDR":                ":9999",
@@ -68,26 +68,55 @@ func TestLoadOverrides(t *testing.T) {
 	}
 }
 
-func TestLoadCollectsAllErrors(t *testing.T) {
-	_, err := Load(env(map[string]string{
-		"LOG_LEVEL":                "loud",
-		"HTTP_READ_TIMEOUT":        "soon",
+func TestLoadCollectsAllParseErrors(t *testing.T) {
+	_, err := Load(envFrom(map[string]string{
+		"LOG_LEVEL":           "loud",
+		"HTTP_READ_TIMEOUT":   "soon",
+		"DB_MIGRATE_ON_START": "maybe",
+	}))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, want := range []string{`LOG_LEVEL="loud"`, `HTTP_READ_TIMEOUT="soon"`, `DB_MIGRATE_ON_START="maybe"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not mention %s:\n%v", want, err)
+		}
+	}
+}
+
+func TestLoadCollectsAllValidationErrors(t *testing.T) {
+	_, err := Load(envFrom(map[string]string{
 		"HTTP_MAX_IN_FLIGHT":       "0",
 		"HTTP_RATE_LIMIT_RPS":      "NaN",
+		"UPSTREAM_RATE_LIMIT_RPS":  "+Inf",
 		"UPSTREAM_AIR_QUALITY_URL": "ftp://example.com",
 		"UPSTREAM_GEOCODING_URL":   "https://user:pw@example.com",
-		"DB_MIGRATE_ON_START":      "maybe",
 		"DB_MAX_IDLE_CONNS":        "50",
 	}))
 	if err == nil {
 		t.Fatal("expected error")
 	}
 	for _, want := range []string{
-		"LOG_LEVEL", "HTTP_READ_TIMEOUT", "HTTP_MAX_IN_FLIGHT", "HTTP_RATE_LIMIT_RPS",
-		"UPSTREAM_AIR_QUALITY_URL", "UPSTREAM_GEOCODING_URL", "DB_MIGRATE_ON_START", "DB_MAX_IDLE_CONNS",
+		"HTTP_MAX_IN_FLIGHT", "HTTP_RATE_LIMIT_RPS", "UPSTREAM_RATE_LIMIT_RPS",
+		"UPSTREAM_AIR_QUALITY_URL", "UPSTREAM_GEOCODING_URL", "DB_MAX_IDLE_CONNS",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not mention %s:\n%v", want, err)
+		}
+	}
+}
+
+func TestLoadOnlyReadsDeclaredVariables(t *testing.T) {
+	var asked []string
+	if _, err := Load(func(k string) string { asked = append(asked, k); return "" }); err != nil {
+		t.Fatal(err)
+	}
+	if len(asked) < 40 {
+		t.Errorf("expected every declared variable to be looked up, got %d", len(asked))
+	}
+	for _, k := range asked {
+		if strings.ToUpper(k) != k || strings.ContainsAny(k, " .") {
+			t.Errorf("unexpected variable name %q", k)
 		}
 	}
 }
@@ -103,7 +132,7 @@ func TestLoadCrossFieldValidation(t *testing.T) {
 	}
 	for name, vars := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := Load(env(vars)); err == nil {
+			if _, err := Load(envFrom(vars)); err == nil {
 				t.Fatal("expected validation error")
 			}
 		})
@@ -111,7 +140,7 @@ func TestLoadCrossFieldValidation(t *testing.T) {
 }
 
 func TestLogValueRedactsSecrets(t *testing.T) {
-	cfg, err := Load(env(map[string]string{
+	cfg, err := Load(envFrom(map[string]string{
 		"DATABASE_URL":     "postgres://app:s3cr3t-pass@db:5432/air?sslmode=disable",
 		"UPSTREAM_API_KEY": "super-secret-key",
 	}))

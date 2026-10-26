@@ -1,205 +1,173 @@
 // Package config loads and validates the service configuration from environment
-// variables. Every setting has a production-safe default so the service can start with
-// an empty environment; invalid values are collected and reported together so a bad
-// deploy fails fast with one actionable error instead of a crash loop of one-at-a-time
-// fixes.
+// variables. Parsing is declarative (caarlos0/env struct tags); cross-field rules live
+// in validate. Every setting has a production-safe default so the service can start
+// with an empty environment, and invalid values are reported together so a bad deploy
+// fails fast with one actionable error instead of a crash loop of one-at-a-time fixes.
 package config
 
 import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"net/url"
-	"strconv"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/caarlos0/env/v11"
 )
 
 // Config is the complete runtime configuration.
 type Config struct {
-	Log      Log
-	HTTP     HTTP
-	Health   Health
+	Log      Log    `envPrefix:"LOG_"`
+	HTTP     HTTP   `envPrefix:"HTTP_"`
+	Health   Health `envPrefix:"HEALTH_"`
 	Admin    Admin
-	Upstream Upstream
-	Cache    Cache
+	Upstream Upstream `envPrefix:"UPSTREAM_"`
+	Cache    Cache    `envPrefix:"CACHE_"`
 	DB       DB
 }
 
 // Log configures structured logging.
 type Log struct {
-	Level  slog.Level
-	Format string // "json" or "text"
+	Level  slog.Level `env:"LEVEL"  envDefault:"info"`
+	Format string     `env:"FORMAT" envDefault:"json"` // "json" or "text"
 }
 
 // HTTP configures the public listener and its protective limits.
 type HTTP struct {
-	Addr              string
-	ReadHeaderTimeout time.Duration
-	ReadTimeout       time.Duration
-	WriteTimeout      time.Duration
-	IdleTimeout       time.Duration
-	MaxHeaderBytes    int
+	Addr              string        `env:"ADDR"                envDefault:":8080"`
+	ReadHeaderTimeout time.Duration `env:"READ_HEADER_TIMEOUT" envDefault:"5s"`
+	ReadTimeout       time.Duration `env:"READ_TIMEOUT"        envDefault:"10s"`
+	WriteTimeout      time.Duration `env:"WRITE_TIMEOUT"       envDefault:"30s"`
+	IdleTimeout       time.Duration `env:"IDLE_TIMEOUT"        envDefault:"120s"`
+	MaxHeaderBytes    int           `env:"MAX_HEADER_BYTES"    envDefault:"16384"`
 	// RequestTimeout is the deadline attached to every API request context.
-	RequestTimeout time.Duration
+	RequestTimeout time.Duration `env:"REQUEST_TIMEOUT" envDefault:"10s"`
 	// ShutdownTimeout bounds how long in-flight requests may take to finish on SIGTERM.
-	ShutdownTimeout time.Duration
+	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"20s"`
 	// DrainDelay is how long the service keeps serving (while reporting not-ready)
 	// after SIGTERM so load balancers can deregister it before connections are closed.
-	DrainDelay        time.Duration
-	MaxInFlight       int
-	RateLimitRPS      float64
-	RateLimitBurst    int
-	TrustProxyHeaders bool
+	DrainDelay        time.Duration `env:"DRAIN_DELAY"          envDefault:"5s"`
+	MaxInFlight       int           `env:"MAX_IN_FLIGHT"        envDefault:"256"`
+	RateLimitRPS      float64       `env:"RATE_LIMIT_RPS"       envDefault:"10"`
+	RateLimitBurst    int           `env:"RATE_LIMIT_BURST"     envDefault:"20"`
+	TrustProxyHeaders bool          `env:"TRUST_PROXY_HEADERS"  envDefault:"false"`
 }
 
 // Health configures dependency checks.
 type Health struct {
 	// CacheTTL bounds how often checks hit dependencies, however often /health and
 	// /readyz are probed.
-	CacheTTL time.Duration
+	CacheTTL time.Duration `env:"CACHE_TTL" envDefault:"2s"`
 	// Interval is how often checks run in the background to keep metrics current.
-	Interval time.Duration
+	Interval time.Duration `env:"INTERVAL" envDefault:"15s"`
 }
 
 // Admin configures the optional private listener used for profiling.
 type Admin struct {
-	Addr         string // empty disables the admin listener
-	PprofEnabled bool
+	Addr         string `env:"ADMIN_ADDR"`    // empty disables the admin listener
+	PprofEnabled bool   `env:"PPROF_ENABLED"` // only honoured when ADMIN_ADDR is set
 }
 
 // Upstream configures the Open-Meteo clients and their resilience policies.
 type Upstream struct {
-	AirQualityURL    string
-	GeocodingURL     string
-	APIKey           string // optional; only needed for Open-Meteo commercial plans
-	AttemptTimeout   time.Duration
-	MaxAttempts      int
-	RetryBaseDelay   time.Duration
-	RetryMaxDelay    time.Duration
-	RateLimitRPS     float64
-	RateLimitBurst   int
-	MaxConcurrent    int
-	BreakerThreshold int
-	BreakerCooldown  time.Duration
-	MaxResponseBytes int64
+	AirQualityURL    string        `env:"AIR_QUALITY_URL"    envDefault:"https://air-quality-api.open-meteo.com"`
+	GeocodingURL     string        `env:"GEOCODING_URL"      envDefault:"https://geocoding-api.open-meteo.com"`
+	APIKey           string        `env:"API_KEY"` // optional; only for Open-Meteo commercial plans
+	AttemptTimeout   time.Duration `env:"ATTEMPT_TIMEOUT"    envDefault:"3s"`
+	MaxAttempts      int           `env:"MAX_ATTEMPTS"       envDefault:"3"`
+	RetryBaseDelay   time.Duration `env:"RETRY_BASE_DELAY"   envDefault:"100ms"`
+	RetryMaxDelay    time.Duration `env:"RETRY_MAX_DELAY"    envDefault:"1s"`
+	RateLimitRPS     float64       `env:"RATE_LIMIT_RPS"     envDefault:"5"`
+	RateLimitBurst   int           `env:"RATE_LIMIT_BURST"   envDefault:"10"`
+	MaxConcurrent    int           `env:"MAX_CONCURRENT"     envDefault:"16"`
+	BreakerThreshold int           `env:"BREAKER_THRESHOLD"  envDefault:"5"`
+	BreakerCooldown  time.Duration `env:"BREAKER_COOLDOWN"   envDefault:"30s"`
+	MaxResponseBytes int64         `env:"MAX_RESPONSE_BYTES" envDefault:"1048576"`
 }
 
 // Cache configures the in-memory response caches.
 type Cache struct {
-	MaxEntries  int
-	CurrentTTL  time.Duration
-	ForecastTTL time.Duration
-	GeocodeTTL  time.Duration
-	NotFoundTTL time.Duration
+	MaxEntries  int           `env:"MAX_ENTRIES"   envDefault:"5000"`
+	CurrentTTL  time.Duration `env:"CURRENT_TTL"   envDefault:"10m"`
+	ForecastTTL time.Duration `env:"FORECAST_TTL"  envDefault:"30m"`
+	GeocodeTTL  time.Duration `env:"GEOCODE_TTL"   envDefault:"24h"`
+	NotFoundTTL time.Duration `env:"NOT_FOUND_TTL" envDefault:"10m"`
 	// StaleFor is how long past expiry an entry is kept so it can be served when the
 	// upstream is failing (stale-if-error).
-	StaleFor time.Duration
+	StaleFor time.Duration `env:"STALE_FOR" envDefault:"1h"`
 }
 
 // DB configures PostgreSQL access and the asynchronous response recorder.
 type DB struct {
-	URL               string // empty disables persistence entirely
-	MaxOpenConns      int
-	MaxIdleConns      int
-	ConnMaxLifetime   time.Duration
-	ConnMaxIdleTime   time.Duration
-	StatementTimeout  time.Duration
-	MigrateOnStart    bool
-	RecorderBuffer    int
-	RecorderBatchSize int
-	RecorderFlush     time.Duration
-	RecorderMaxBody   int
-	Retention         time.Duration // 0 disables the retention job
-	RetentionInterval time.Duration
+	URL               string        `env:"DATABASE_URL"` // empty disables persistence entirely
+	MaxOpenConns      int           `env:"DB_MAX_OPEN_CONNS"       envDefault:"10"`
+	MaxIdleConns      int           `env:"DB_MAX_IDLE_CONNS"       envDefault:"5"`
+	ConnMaxLifetime   time.Duration `env:"DB_CONN_MAX_LIFETIME"    envDefault:"30m"`
+	ConnMaxIdleTime   time.Duration `env:"DB_CONN_MAX_IDLE_TIME"   envDefault:"5m"`
+	StatementTimeout  time.Duration `env:"DB_STATEMENT_TIMEOUT"    envDefault:"5s"`
+	MigrateOnStart    bool          `env:"DB_MIGRATE_ON_START"     envDefault:"false"`
+	RecorderBuffer    int           `env:"RECORDER_BUFFER"         envDefault:"1024"`
+	RecorderBatchSize int           `env:"RECORDER_BATCH_SIZE"     envDefault:"100"`
+	RecorderFlush     time.Duration `env:"RECORDER_FLUSH_INTERVAL" envDefault:"1s"`
+	RecorderMaxBody   int           `env:"RECORDER_MAX_BODY_BYTES" envDefault:"65536"`
+	Retention         time.Duration `env:"DB_RETENTION"            envDefault:"720h"` // 0 disables the retention job
+	RetentionInterval time.Duration `env:"DB_RETENTION_INTERVAL"   envDefault:"1h"`
 }
 
 // Load reads the configuration using getenv (typically os.Getenv).
+//
+// Only the variables Config declares are read, through getenv rather than the process
+// environment, which keeps Load deterministic in tests. Values are trimmed, and an
+// empty value means "use the default".
 func Load(getenv func(string) string) (Config, error) {
-	l := &loader{getenv: getenv}
-
 	var cfg Config
-
-	cfg.Log.Level = l.level("LOG_LEVEL", slog.LevelInfo)
-	cfg.Log.Format = l.str("LOG_FORMAT", "json")
-
-	cfg.HTTP = HTTP{
-		Addr:              l.str("HTTP_ADDR", ":8080"),
-		ReadHeaderTimeout: l.duration("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
-		ReadTimeout:       l.duration("HTTP_READ_TIMEOUT", 10*time.Second),
-		WriteTimeout:      l.duration("HTTP_WRITE_TIMEOUT", 30*time.Second),
-		IdleTimeout:       l.duration("HTTP_IDLE_TIMEOUT", 120*time.Second),
-		MaxHeaderBytes:    l.integer("HTTP_MAX_HEADER_BYTES", 16<<10),
-		RequestTimeout:    l.duration("HTTP_REQUEST_TIMEOUT", 10*time.Second),
-		ShutdownTimeout:   l.duration("HTTP_SHUTDOWN_TIMEOUT", 20*time.Second),
-		DrainDelay:        l.duration("HTTP_DRAIN_DELAY", 5*time.Second),
-		MaxInFlight:       l.integer("HTTP_MAX_IN_FLIGHT", 256),
-		RateLimitRPS:      l.float("HTTP_RATE_LIMIT_RPS", 10),
-		RateLimitBurst:    l.integer("HTTP_RATE_LIMIT_BURST", 20),
-		TrustProxyHeaders: l.boolean("HTTP_TRUST_PROXY_HEADERS", false),
+	params, err := env.GetFieldParams(&cfg)
+	if err != nil {
+		return Config{}, err
 	}
-
-	cfg.Health = Health{
-		CacheTTL: l.duration("HEALTH_CACHE_TTL", 2*time.Second),
-		Interval: l.duration("HEALTH_INTERVAL", 15*time.Second),
+	environ := make(map[string]string, len(params))
+	for _, p := range params {
+		if v := strings.TrimSpace(getenv(p.Key)); v != "" {
+			environ[p.Key] = v
+		}
 	}
-
-	cfg.Admin = Admin{
-		Addr:         l.str("ADMIN_ADDR", ""),
-		PprofEnabled: l.boolean("PPROF_ENABLED", false),
+	if err := env.ParseWithOptions(&cfg, env.Options{Environment: environ}); err != nil {
+		return Config{}, fmt.Errorf("invalid configuration: %w", attribute(environ, err))
 	}
-
-	cfg.Upstream = Upstream{
-		AirQualityURL:    l.str("UPSTREAM_AIR_QUALITY_URL", "https://air-quality-api.open-meteo.com"),
-		GeocodingURL:     l.str("UPSTREAM_GEOCODING_URL", "https://geocoding-api.open-meteo.com"),
-		APIKey:           l.str("UPSTREAM_API_KEY", ""),
-		AttemptTimeout:   l.duration("UPSTREAM_ATTEMPT_TIMEOUT", 3*time.Second),
-		MaxAttempts:      l.integer("UPSTREAM_MAX_ATTEMPTS", 3),
-		RetryBaseDelay:   l.duration("UPSTREAM_RETRY_BASE_DELAY", 100*time.Millisecond),
-		RetryMaxDelay:    l.duration("UPSTREAM_RETRY_MAX_DELAY", time.Second),
-		RateLimitRPS:     l.float("UPSTREAM_RATE_LIMIT_RPS", 5),
-		RateLimitBurst:   l.integer("UPSTREAM_RATE_LIMIT_BURST", 10),
-		MaxConcurrent:    l.integer("UPSTREAM_MAX_CONCURRENT", 16),
-		BreakerThreshold: l.integer("UPSTREAM_BREAKER_THRESHOLD", 5),
-		BreakerCooldown:  l.duration("UPSTREAM_BREAKER_COOLDOWN", 30*time.Second),
-		MaxResponseBytes: int64(l.integer("UPSTREAM_MAX_RESPONSE_BYTES", 1<<20)),
-	}
-
-	cfg.Cache = Cache{
-		MaxEntries:  l.integer("CACHE_MAX_ENTRIES", 5000),
-		CurrentTTL:  l.duration("CACHE_CURRENT_TTL", 10*time.Minute),
-		ForecastTTL: l.duration("CACHE_FORECAST_TTL", 30*time.Minute),
-		GeocodeTTL:  l.duration("CACHE_GEOCODE_TTL", 24*time.Hour),
-		NotFoundTTL: l.duration("CACHE_NOT_FOUND_TTL", 10*time.Minute),
-		StaleFor:    l.duration("CACHE_STALE_FOR", time.Hour),
-	}
-
-	cfg.DB = DB{
-		URL:               l.str("DATABASE_URL", ""),
-		MaxOpenConns:      l.integer("DB_MAX_OPEN_CONNS", 10),
-		MaxIdleConns:      l.integer("DB_MAX_IDLE_CONNS", 5),
-		ConnMaxLifetime:   l.duration("DB_CONN_MAX_LIFETIME", 30*time.Minute),
-		ConnMaxIdleTime:   l.duration("DB_CONN_MAX_IDLE_TIME", 5*time.Minute),
-		StatementTimeout:  l.duration("DB_STATEMENT_TIMEOUT", 5*time.Second),
-		MigrateOnStart:    l.boolean("DB_MIGRATE_ON_START", false),
-		RecorderBuffer:    l.integer("RECORDER_BUFFER", 1024),
-		RecorderBatchSize: l.integer("RECORDER_BATCH_SIZE", 100),
-		RecorderFlush:     l.duration("RECORDER_FLUSH_INTERVAL", time.Second),
-		RecorderMaxBody:   l.integer("RECORDER_MAX_BODY_BYTES", 64<<10),
-		Retention:         l.duration("DB_RETENTION", 30*24*time.Hour),
-		RetentionInterval: l.duration("DB_RETENTION_INTERVAL", time.Hour),
-	}
-
-	cfg.validate(l)
-
-	if len(l.errs) > 0 {
-		return Config{}, fmt.Errorf("invalid configuration: %w", errors.Join(l.errs...))
+	if err := cfg.validate(); err != nil {
+		return Config{}, fmt.Errorf("invalid configuration: %w", err)
 	}
 	return cfg, nil
 }
 
-func (c *Config) validate(l *loader) {
+// attribute rewrites parse errors to name the environment variable, which is what an
+// operator has to fix; env.ParseError only knows the struct field, and field names
+// repeat across sections. Each set variable is re-parsed on its own, on the error
+// path only.
+func attribute(environ map[string]string, err error) error {
+	var errs []error
+	for _, key := range slices.Sorted(maps.Keys(environ)) {
+		perr := env.ParseWithOptions(&Config{}, env.Options{Environment: map[string]string{key: environ[key]}})
+		if perr == nil {
+			continue
+		}
+		if pe := (env.ParseError{}); errors.As(perr, &pe) {
+			perr = pe.Err
+		}
+		errs = append(errs, fmt.Errorf("%s=%q: %w", key, environ[key], perr))
+	}
+	if len(errs) == 0 {
+		return err
+	}
+	return errors.Join(errs...)
+}
+
+func (c *Config) validate() error {
+	l := &problems{}
 	l.check(c.Log.Format == "json" || c.Log.Format == "text", "LOG_FORMAT must be json or text, got %q", c.Log.Format)
 
 	h := c.HTTP
@@ -216,7 +184,7 @@ func (c *Config) validate(l *loader) {
 		h.WriteTimeout, h.RequestTimeout)
 	l.check(h.MaxHeaderBytes >= 1<<10, "HTTP_MAX_HEADER_BYTES must be at least 1024")
 	l.check(h.MaxInFlight >= 1, "HTTP_MAX_IN_FLIGHT must be at least 1")
-	l.check(h.RateLimitRPS > 0, "HTTP_RATE_LIMIT_RPS must be positive")
+	l.rate("HTTP_RATE_LIMIT_RPS", h.RateLimitRPS)
 	l.check(h.RateLimitBurst >= 1, "HTTP_RATE_LIMIT_BURST must be at least 1")
 
 	l.check(c.Health.CacheTTL >= 0, "HEALTH_CACHE_TTL must not be negative")
@@ -229,7 +197,7 @@ func (c *Config) validate(l *loader) {
 	l.check(u.MaxAttempts >= 1 && u.MaxAttempts <= 10, "UPSTREAM_MAX_ATTEMPTS must be between 1 and 10")
 	l.positive("UPSTREAM_RETRY_BASE_DELAY", u.RetryBaseDelay)
 	l.check(u.RetryMaxDelay >= u.RetryBaseDelay, "UPSTREAM_RETRY_MAX_DELAY must be >= UPSTREAM_RETRY_BASE_DELAY")
-	l.check(u.RateLimitRPS > 0, "UPSTREAM_RATE_LIMIT_RPS must be positive")
+	l.rate("UPSTREAM_RATE_LIMIT_RPS", u.RateLimitRPS)
 	l.check(u.RateLimitBurst >= 1, "UPSTREAM_RATE_LIMIT_BURST must be at least 1")
 	l.check(u.MaxConcurrent >= 1, "UPSTREAM_MAX_CONCURRENT must be at least 1")
 	l.check(u.BreakerThreshold >= 1, "UPSTREAM_BREAKER_THRESHOLD must be at least 1")
@@ -258,6 +226,7 @@ func (c *Config) validate(l *loader) {
 	l.check(d.RecorderMaxBody >= 0, "RECORDER_MAX_BODY_BYTES must not be negative")
 	l.check(d.Retention >= 0, "DB_RETENTION must not be negative (0 disables retention)")
 	l.positive("DB_RETENTION_INTERVAL", d.RetentionInterval)
+	return errors.Join(l.errs...)
 }
 
 // LogValue implements slog.LogValuer so the effective configuration can be logged at
@@ -299,112 +268,34 @@ func RedactDSN(dsn string) string {
 	return u.Redacted()
 }
 
-type loader struct {
-	getenv func(string) string
-	errs   []error
+type problems struct {
+	errs []error
 }
 
-func (l *loader) lookup(key string) (string, bool) {
-	v := strings.TrimSpace(l.getenv(key))
-	return v, v != ""
-}
-
-func (l *loader) fail(format string, args ...any) {
-	l.errs = append(l.errs, fmt.Errorf(format, args...))
-}
-
-func (l *loader) check(ok bool, format string, args ...any) {
+func (l *problems) check(ok bool, format string, args ...any) {
 	if !ok {
-		l.fail(format, args...)
+		l.errs = append(l.errs, fmt.Errorf(format, args...))
 	}
 }
 
-func (l *loader) positive(key string, d time.Duration) {
+func (l *problems) positive(key string, d time.Duration) {
 	l.check(d > 0, "%s must be positive, got %s", key, d)
 }
 
-func (l *loader) str(key, def string) string {
-	if v, ok := l.lookup(key); ok {
-		return v
-	}
-	return def
+func (l *problems) rate(key string, f float64) {
+	l.check(f > 0 && !math.IsInf(f, 0), "%s must be a positive finite number, got %v", key, f)
 }
 
-func (l *loader) duration(key string, def time.Duration) time.Duration {
-	v, ok := l.lookup(key)
-	if !ok {
-		return def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		l.fail("%s: invalid duration %q (examples: 500ms, 10s, 5m)", key, v)
-		return def
-	}
-	return d
-}
-
-func (l *loader) integer(key string, def int) int {
-	v, ok := l.lookup(key)
-	if !ok {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		l.fail("%s: invalid integer %q", key, v)
-		return def
-	}
-	return n
-}
-
-func (l *loader) float(key string, def float64) float64 {
-	v, ok := l.lookup(key)
-	if !ok {
-		return def
-	}
-	f, err := strconv.ParseFloat(v, 64)
-	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
-		l.fail("%s: invalid number %q", key, v)
-		return def
-	}
-	return f
-}
-
-func (l *loader) boolean(key string, def bool) bool {
-	v, ok := l.lookup(key)
-	if !ok {
-		return def
-	}
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		l.fail("%s: invalid boolean %q (use true or false)", key, v)
-		return def
-	}
-	return b
-}
-
-func (l *loader) level(key string, def slog.Level) slog.Level {
-	v, ok := l.lookup(key)
-	if !ok {
-		return def
-	}
-	var lvl slog.Level
-	if err := lvl.UnmarshalText([]byte(v)); err != nil {
-		l.fail("%s: invalid level %q (use debug, info, warn or error)", key, v)
-		return def
-	}
-	return lvl
-}
-
-func (l *loader) baseURL(key, raw string) {
+func (l *problems) baseURL(key, raw string) {
 	u, err := url.Parse(raw)
 	switch {
 	case err != nil:
-		l.fail("%s: invalid URL: %v", key, err)
+		l.check(false, "%s: invalid URL: %v", key, err)
 	case u.Scheme != "http" && u.Scheme != "https":
-		l.fail("%s: scheme must be http or https, got %q", key, u.Scheme)
+		l.check(false, "%s: scheme must be http or https, got %q", key, u.Scheme)
 	case u.Host == "":
-		l.fail("%s: host must not be empty", key)
+		l.check(false, "%s: host must not be empty", key)
 	case u.RawQuery != "" || u.Fragment != "" || u.User != nil:
-		l.fail("%s: must not contain credentials, query or fragment", key)
+		l.check(false, "%s: must not contain credentials, query or fragment", key)
 	}
 }
