@@ -16,6 +16,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/votiakov/airq/internal/airquality"
 	"github.com/votiakov/airq/internal/health"
@@ -74,6 +77,7 @@ type harness struct {
 	handler http.Handler
 	reg     *prometheus.Registry
 	logs    *bytes.Buffer
+	spans   *tracetest.SpanRecorder
 }
 
 func newHarness(t *testing.T, svc Service, mutate func(*Options)) *harness {
@@ -81,7 +85,9 @@ func newHarness(t *testing.T, svc Service, mutate func(*Options)) *harness {
 	reg := prometheus.NewRegistry()
 	logs := &bytes.Buffer{}
 	logger := telemetry.NewLogger(&syncWriter{w: logs}, slog.LevelDebug, "json")
+	spans := tracetest.NewSpanRecorder()
 	opts := Options{
+		TracerProvider: sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans)),
 		Service:        svc,
 		Health:         health.NewChecker(reg, 0),
 		Registry:       reg,
@@ -95,7 +101,7 @@ func newHarness(t *testing.T, svc Service, mutate func(*Options)) *harness {
 	if mutate != nil {
 		mutate(&opts)
 	}
-	return &harness{handler: NewHandler(opts), reg: reg, logs: logs}
+	return &harness{handler: NewHandler(opts), reg: reg, logs: logs, spans: spans}
 }
 
 type syncWriter struct {
@@ -457,22 +463,79 @@ func TestLoadShedding(t *testing.T) {
 	}
 }
 
-func TestRequestIDAndTraceContext(t *testing.T) {
+const (
+	incomingTraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	incomingParent  = "00-" + incomingTraceID + "-00f067aa0ba902b7-01"
+)
+
+func TestRequestID(t *testing.T) {
 	h := newHarness(t, okService(), nil)
-	rec := h.do(t, http.MethodGet, "/livez", map[string]string{"X-Request-ID": "abc-123"})
+	rec := h.do(t, http.MethodGet, "/v1/air-quality/Berlin", map[string]string{"X-Request-ID": "abc-123"})
 	if rec.Header().Get("X-Request-ID") != "abc-123" {
 		t.Errorf("valid request id not honoured: %q", rec.Header().Get("X-Request-ID"))
 	}
-	rec = h.do(t, http.MethodGet, "/livez", map[string]string{
-		"X-Request-ID": "bad id\nwith newline",
-		"traceparent":  "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+	rec = h.do(t, http.MethodGet, "/v1/air-quality/Berlin", map[string]string{"X-Request-ID": "bad id\nwith newline"})
+	spans := h.spans.Ended()
+	if got := rec.Header().Get("X-Request-ID"); got != spans[len(spans)-1].SpanContext().TraceID().String() {
+		t.Errorf("an invalid request id should fall back to the trace id, got %q", got)
+	}
+	if rec := h.do(t, http.MethodGet, "/livez", nil); len(rec.Header().Get("X-Request-ID")) < 16 {
+		t.Errorf("untraced routes still need a request id, got %q", rec.Header().Get("X-Request-ID"))
+	}
+}
+
+func TestServerSpans(t *testing.T) {
+	h := newHarness(t, okService(), nil)
+	h.do(t, http.MethodGet, "/v1/air-quality/Berlin", nil)
+	h.do(t, http.MethodGet, "/livez", nil)
+	h.do(t, http.MethodGet, "/metrics", nil)
+
+	spans := h.spans.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("recorded %d spans, want 1 (probes and scrapes are not traced)", len(spans))
+	}
+	s := spans[0]
+	if s.Name() != "GET /v1/air-quality/{location}" || s.SpanKind() != trace.SpanKindServer {
+		t.Errorf("span = %q kind %v", s.Name(), s.SpanKind())
+	}
+	attrs := map[string]string{}
+	for _, kv := range s.Attributes() {
+		attrs[string(kv.Key)] = kv.Value.String()
+	}
+	if attrs["http.route"] != "/v1/air-quality/{location}" || attrs["airq.request_id"] == "" {
+		t.Errorf("attributes = %v", attrs)
+	}
+	if !strings.Contains(h.logs.String(), `"trace_id":"`+s.SpanContext().TraceID().String()+`"`) {
+		t.Error("access log does not carry the trace id")
+	}
+}
+
+func TestIncomingTraceContextIsTrustedOnlyBehindProxy(t *testing.T) {
+	t.Run("untrusted caller", func(t *testing.T) {
+		h := newHarness(t, okService(), nil)
+		rec := h.do(t, http.MethodGet, "/v1/air-quality/Berlin", map[string]string{"traceparent": incomingParent})
+		s := h.spans.Ended()[0]
+		if s.SpanContext().TraceID().String() == incomingTraceID || s.Parent().IsValid() {
+			t.Error("a public endpoint must start a new trace instead of adopting the caller's")
+		}
+		if len(s.Links()) != 1 || s.Links()[0].SpanContext.TraceID().String() != incomingTraceID {
+			t.Errorf("the caller's trace should be linked, links = %+v", s.Links())
+		}
+		if rec.Header().Get("X-Request-ID") == incomingTraceID {
+			t.Error("request id must not be derived from an untrusted trace id")
+		}
 	})
-	if got := rec.Header().Get("X-Request-ID"); got != "4bf92f3577b34da6a3ce929d0e0e4736" {
-		t.Errorf("invalid request id should fall back to the incoming trace id, got %q", got)
-	}
-	if !strings.Contains(h.logs.String(), `"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"`) {
-		t.Error("access log does not carry the propagated trace id")
-	}
+	t.Run("trusted proxy", func(t *testing.T) {
+		h := newHarness(t, okService(), func(o *Options) { o.TrustProxyHeaders = true })
+		rec := h.do(t, http.MethodGet, "/v1/air-quality/Berlin", map[string]string{"traceparent": incomingParent})
+		s := h.spans.Ended()[0]
+		if s.SpanContext().TraceID().String() != incomingTraceID || s.Parent().SpanID().String() != "00f067aa0ba902b7" {
+			t.Errorf("trace context not continued: %v parent %v", s.SpanContext().TraceID(), s.Parent().SpanID())
+		}
+		if rec.Header().Get("X-Request-ID") != incomingTraceID {
+			t.Errorf("X-Request-ID = %q, want the propagated trace id", rec.Header().Get("X-Request-ID"))
+		}
+	})
 }
 
 func TestMetricsUseRoutePatternsNotPaths(t *testing.T) {

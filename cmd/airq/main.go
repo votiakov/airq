@@ -84,7 +84,8 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout 
 //  2. after HTTP_DRAIN_DELAY (time for deregistration to propagate) the listener
 //     stops accepting and in-flight requests get HTTP_SHUTDOWN_TIMEOUT to finish;
 //  3. background jobs stop and the recorder flushes its queue;
-//  4. the database pool closes.
+//  4. the database pool closes;
+//  5. buffered trace spans are flushed to the collector.
 //
 // onListen, if set, is told the bound address (used by tests).
 func serve(ctx context.Context, getenv func(string) string, stdout io.Writer, onListen func(net.Addr)) error {
@@ -95,6 +96,18 @@ func serve(ctx context.Context, getenv func(string) string, stdout io.Writer, on
 	logger := telemetry.NewLogger(stdout, cfg.Log.Level, cfg.Log.Format)
 	slog.SetDefault(logger)
 	logger.InfoContext(ctx, "starting airq", "build", version.Get(), "config", cfg)
+
+	tp, err := telemetry.SetupTracing(ctx, getenv, logger)
+	if err != nil {
+		return err
+	}
+	defer func() { // registered first, so it runs last and captures spans from shutdown itself
+		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := tp.Shutdown(fctx); err != nil {
+			logger.WarnContext(ctx, "flushing trace spans failed", "error", err)
+		}
+	}()
 
 	reg := telemetry.NewRegistry()
 	bgCtx, stopBackground := context.WithCancel(context.WithoutCancel(ctx))

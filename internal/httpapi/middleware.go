@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -14,6 +15,9 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 
 	"github.com/votiakov/airq/internal/cache"
@@ -50,24 +54,24 @@ func (rr *responseRecorder) Unwrap() http.ResponseWriter { return rr.ResponseWri
 
 func (rr *responseRecorder) headerWritten() bool { return rr.status != 0 }
 
-// requestContext assigns the request ID and W3C trace context used by every log line
-// and exemplar. A caller-supplied X-Request-ID is honoured only if it is short and
-// uses a safe alphabet (it ends up in logs and the database).
+// requestContext assigns the request ID carried by every log line and audit row. A
+// caller-supplied X-Request-ID is honoured only if it is short and uses a safe
+// alphabet (it ends up in logs and the database); otherwise the trace ID is used, so
+// one identifier finds the request in logs, traces and the database.
 func requestContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tc, ok := telemetry.ParseTraceparent(r.Header.Get("traceparent"))
-		if ok {
-			tc = tc.Child()
-		} else {
-			tc = telemetry.NewTraceContext()
-		}
 		id := r.Header.Get("X-Request-ID")
+		span := trace.SpanFromContext(r.Context())
 		if !validRequestID(id) {
-			id = tc.TraceIDString()
+			if sc := span.SpanContext(); sc.HasTraceID() {
+				id = sc.TraceID().String()
+			} else {
+				id = rand.Text()
+			}
 		}
+		span.SetAttributes(attribute.String("airq.request_id", id))
 		w.Header().Set("X-Request-ID", id)
-		ctx := telemetry.WithRequestInfo(r.Context(), telemetry.RequestInfo{RequestID: id, Trace: tc})
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, r.WithContext(telemetry.WithRequestID(r.Context(), id)))
 	})
 }
 
@@ -95,6 +99,12 @@ func observe(mux *http.ServeMux, m *metrics, log *slog.Logger, trustProxy bool, 
 		start := time.Now()
 		_, pattern := mux.Handler(r)
 		route := routeLabel(pattern)
+		if pattern != "" {
+			// otelhttp runs before routing; name the span after the route template.
+			span := trace.SpanFromContext(r.Context())
+			span.SetName(r.Method + " " + route)
+			span.SetAttributes(semconv.HTTPRoute(route))
+		}
 
 		rec := &responseRecorder{ResponseWriter: w}
 		var ww http.ResponseWriter = rec

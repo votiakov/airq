@@ -38,6 +38,11 @@ import (
 
 	"github.com/cenkalti/backoff/v5"
 	"github.com/sony/gobreaker/v2"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/time/rate"
 
@@ -71,6 +76,9 @@ type Exchange struct {
 	Duration   time.Duration
 	Body       []byte // raw response body, nil on transport errors
 	Error      string
+	// Trace identifies the logical call's span so asynchronous consumers (the
+	// recorder's batched writes) can link back to the request that caused them.
+	Trace trace.SpanContext
 }
 
 // Recorder receives exchanges. Implementations must not block.
@@ -99,6 +107,7 @@ type Config struct {
 	Recorder         Recorder // optional
 	Logger           *slog.Logger
 	Now              func() time.Time
+	TracerProvider   trace.TracerProvider // defaults to the global provider
 }
 
 // Client is safe for concurrent use.
@@ -110,6 +119,7 @@ type Client struct {
 	limiter  *rate.Limiter
 	bulkhead *semaphore.Weighted
 	log      *slog.Logger
+	tracer   trace.Tracer
 }
 
 // New creates a client. BaseURL must be an absolute http(s) URL.
@@ -139,6 +149,9 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Metrics == nil {
 		return nil, errors.New("upstream: Metrics is required")
 	}
+	if cfg.TracerProvider == nil {
+		cfg.TracerProvider = otel.GetTracerProvider()
+	}
 	cfg.Metrics.init(cfg.Name)
 
 	c := &Client{
@@ -147,6 +160,7 @@ func New(cfg Config) (*Client, error) {
 		limiter:  rate.NewLimiter(cfg.RateLimit, max(cfg.RateBurst, 1)),
 		bulkhead: semaphore.NewWeighted(int64(cfg.MaxConcurrent)),
 		log:      cfg.Logger.With(slog.String("upstream", cfg.Name)),
+		tracer:   cfg.TracerProvider.Tracer("github.com/votiakov/airq/internal/upstream"),
 	}
 	threshold := uint32(min(cfg.BreakerThreshold, math.MaxUint32)) //nolint:gosec // bounded to [1, MaxUint32]
 	c.breaker = gobreaker.NewTwoStepCircuitBreaker[struct{}](gobreaker.Settings{
@@ -213,12 +227,21 @@ func (c *Client) Name() string { return c.cfg.Name }
 func (c *Client) CircuitOpen() bool { return c.breaker.State() == gobreaker.StateOpen }
 
 // GetJSON performs GET base+path?query and decodes a 200 response into out.
+//
+// It is traced as one span for the logical call with a client span per attempt.
+// Spans are created here rather than by otelhttp's transport, which records the full
+// URL (including the API key) and would propagate our trace context to the vendor.
 func (c *Client) GetJSON(ctx context.Context, path string, query url.Values, out any) error {
+	ctx, span := c.tracer.Start(ctx, c.cfg.Name+" "+path, trace.WithAttributes(attribute.String("airq.upstream", c.cfg.Name)))
+	defer span.End()
+
 	err := c.getJSON(ctx, path, query, out)
 	outcome := "success"
 	var uerr *Error
 	if errors.As(err, &uerr) {
 		outcome = string(uerr.Kind)
+		span.SetAttributes(semconv.ErrorTypeKey.String(outcome))
+		span.SetStatus(codes.Error, uerr.Error())
 	}
 	c.cfg.Metrics.calls.WithLabelValues(c.cfg.Name, outcome).Inc()
 	return err
@@ -302,8 +325,22 @@ func (c *Client) attempt(ctx context.Context, attempt int, target *url.URL, out 
 	defer c.release()
 
 	start := c.cfg.Now()
-	status, body, uerr := c.do(ctx, target, out)
+	actx, span := c.tracer.Start(ctx, http.MethodGet, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+		semconv.HTTPRequestMethodGet, semconv.URLFull(redactedURL(target)), semconv.ServerAddress(target.Hostname()),
+	))
+	if attempt > 1 {
+		span.SetAttributes(semconv.HTTPRequestResendCount(attempt - 1))
+	}
+	status, body, uerr := c.do(actx, target, out)
 	elapsed := c.cfg.Now().Sub(start)
+	if status != 0 {
+		span.SetAttributes(semconv.HTTPResponseStatusCode(status))
+	}
+	if uerr != nil {
+		span.SetAttributes(semconv.ErrorTypeKey.String(string(uerr.Kind)))
+		span.SetStatus(codes.Error, uerr.Error())
+	}
+	span.End()
 
 	outcome := "success"
 	if uerr != nil {
@@ -338,6 +375,7 @@ func (c *Client) attempt(ctx context.Context, attempt int, target *url.URL, out 
 			Outcome:    outcome,
 			Duration:   elapsed,
 			Body:       body,
+			Trace:      trace.SpanContextFromContext(ctx),
 		}
 		if uerr != nil {
 			ex.Error = uerr.Error()
@@ -461,11 +499,17 @@ func (c *Client) contextError(err error) *Error {
 func redact(err error, target *url.URL) error {
 	var uerr *url.Error
 	if errors.As(err, &uerr) {
-		safe := *target
-		safe.RawQuery = encodeQuery(redactedQuery(target.Query()))
-		return &url.Error{Op: uerr.Op, URL: safe.String(), Err: uerr.Err}
+		return &url.Error{Op: uerr.Op, URL: redactedURL(target), Err: uerr.Err}
 	}
 	return err
+}
+
+// redactedURL renders target without credentials, for errors and span attributes.
+func redactedURL(target *url.URL) string {
+	safe := *target
+	safe.User = nil
+	safe.RawQuery = encodeQuery(redactedQuery(target.Query()))
+	return safe.String()
 }
 
 func redactedQuery(q url.Values) map[string]string {

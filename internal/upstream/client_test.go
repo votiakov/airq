@@ -15,6 +15,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sony/gobreaker/v2"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 )
 
@@ -40,6 +44,7 @@ type fixture struct {
 	metrics  *Metrics
 	recorder *memRecorder
 	hits     *atomic.Int32
+	spans    *tracetest.SpanRecorder
 }
 
 func newFixture(t *testing.T, handler http.HandlerFunc, mutate func(*Config)) *fixture {
@@ -53,7 +58,9 @@ func newFixture(t *testing.T, handler http.HandlerFunc, mutate func(*Config)) *f
 
 	m := NewMetrics(prometheus.NewRegistry())
 	rec := &memRecorder{}
+	spans := tracetest.NewSpanRecorder()
 	cfg := Config{
+		TracerProvider:   sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans)),
 		Name:             "test",
 		BaseURL:          srv.URL,
 		APIKey:           "secret-key",
@@ -77,7 +84,7 @@ func newFixture(t *testing.T, handler http.HandlerFunc, mutate func(*Config)) *f
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &fixture{client: c, metrics: m, recorder: rec, hits: hits}
+	return &fixture{client: c, metrics: m, recorder: rec, hits: hits, spans: spans}
 }
 
 func (f *fixture) count(vec *prometheus.CounterVec, labels ...string) float64 {
@@ -155,6 +162,51 @@ func TestRetriesTransientFailuresThenSucceeds(t *testing.T) {
 	}
 	if len(f.recorder.all()) != 3 {
 		t.Errorf("every attempt must be recorded")
+	}
+}
+
+func TestSpansNeverLeakTheAPIKeyOrPropagateToTheVendor(t *testing.T) {
+	var n atomic.Int32
+	f := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("traceparent") != "" {
+			t.Error("trace context must not be sent to a third party")
+		}
+		if n.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}, nil)
+	if err := f.client.GetJSON(context.Background(), "/v1/thing", url.Values{"lat": {"1"}}, &struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+
+	spans := f.spans.Ended()
+	if len(spans) != 3 {
+		t.Fatalf("got %d spans, want 2 attempts + 1 logical call", len(spans))
+	}
+	call := spans[2]
+	if call.Name() != "test /v1/thing" {
+		t.Errorf("call span = %q", call.Name())
+	}
+	for i, s := range spans[:2] {
+		if s.SpanKind() != trace.SpanKindClient || s.Parent().SpanID() != call.SpanContext().SpanID() {
+			t.Errorf("attempt %d: kind %v, parent %v", i+1, s.SpanKind(), s.Parent().SpanID())
+		}
+		for _, kv := range s.Attributes() {
+			if strings.Contains(kv.Value.String(), "secret-key") {
+				t.Errorf("attempt span leaks the API key in %s", kv.Key)
+			}
+			if kv.Key == "url.full" && !strings.Contains(kv.Value.String(), "lat=1") {
+				t.Errorf("url.full should keep non-secret params: %s", kv.Value.String())
+			}
+		}
+	}
+	if spans[0].Status().Code != codes.Error || spans[1].Status().Code == codes.Error {
+		t.Errorf("statuses = %v, %v", spans[0].Status(), spans[1].Status())
+	}
+	if ex := f.recorder.all()[0]; ex.Trace.SpanID() != call.SpanContext().SpanID() {
+		t.Error("recorded exchanges must reference the logical call span")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/votiakov/airq/internal/version"
 )
@@ -54,13 +55,13 @@ func MetricsHandler(reg *prometheus.Registry, logger *slog.Logger) http.Handler 
 	return promhttp.InstrumentMetricHandler(reg, h)
 }
 
-// Exemplar returns trace exemplar labels for ctx, or nil outside a request.
+// Exemplar returns trace exemplar labels for ctx, or nil without a sampled span.
 func Exemplar(ctx context.Context) prometheus.Labels {
-	info, ok := RequestInfoFrom(ctx)
-	if !ok {
-		return nil
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsSampled() {
+		return nil // an exemplar should point at a trace that was actually recorded
 	}
-	return prometheus.Labels{"trace_id": info.Trace.TraceIDString()}
+	return prometheus.Labels{"trace_id": sc.TraceID().String()}
 }
 
 // ObserveWithExemplar records v on o, attaching the request's trace ID as an exemplar

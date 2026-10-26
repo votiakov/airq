@@ -14,6 +14,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/votiakov/airq/internal/telemetry"
 	"github.com/votiakov/airq/internal/upstream"
@@ -33,6 +37,9 @@ type RecorderOptions struct {
 	WriteTimeout  time.Duration // per-batch deadline
 	Registerer    prometheus.Registerer
 	Logger        *slog.Logger
+	// TracerProvider defaults to the global provider. Each batch write is a root span
+	// linked to the request traces whose exchanges it persists.
+	TracerProvider trace.TracerProvider
 }
 
 // Recorder persists upstream exchanges to upstream_responses asynchronously.
@@ -47,6 +54,7 @@ type Recorder struct {
 	opts    RecorderOptions
 	queries *Metrics
 	log     *slog.Logger
+	tracer  trace.Tracer
 	queue   chan upstream.Exchange
 
 	records   *prometheus.CounterVec
@@ -66,11 +74,15 @@ func NewRecorder(db *sql.DB, queries *Metrics, opts RecorderOptions) *Recorder {
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
+	if opts.TracerProvider == nil {
+		opts.TracerProvider = otel.GetTracerProvider()
+	}
 	r := &Recorder{
 		db:      db,
 		opts:    opts,
 		queries: queries,
 		log:     opts.Logger.With(slog.String("component", "recorder")),
+		tracer:  opts.TracerProvider.Tracer(tracerName),
 		queue:   make(chan upstream.Exchange, max(opts.Buffer, 1)),
 		records: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: telemetry.Namespace, Subsystem: "recorder", Name: "records_total",
@@ -151,9 +163,19 @@ func (r *Recorder) Run(ctx context.Context, drainTimeout time.Duration) {
 
 func (r *Recorder) write(ctx context.Context, batch []upstream.Exchange) {
 	rows := make([][]any, len(batch))
+	links := make([]trace.Link, 0, len(batch))
 	for i, ex := range batch {
 		rows[i] = r.row(ex)
+		if ex.Trace.IsSampled() {
+			links = append(links, trace.Link{SpanContext: ex.Trace})
+		}
 	}
+	// A batch serves many requests, so it is its own trace linked to each of them,
+	// rather than a child of whichever request happened to fill it.
+	ctx, span := r.tracer.Start(ctx, "recorder.write", trace.WithNewRoot(), trace.WithLinks(links...),
+		trace.WithAttributes(attribute.Int("airq.batch_size", len(rows))))
+	defer span.End()
+
 	err := r.insert(ctx, rows)
 	var pgErr *pgconn.PgError
 	if err != nil && errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, "22") && len(rows) > 1 {
@@ -174,6 +196,7 @@ func (r *Recorder) write(ctx context.Context, batch []upstream.Exchange) {
 		return
 	}
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		r.records.WithLabelValues("failed").Add(float64(len(rows)))
 		r.throttledError("recorder batch insert failed", err, slog.Int("rows", len(rows)))
 		return

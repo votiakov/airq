@@ -14,10 +14,13 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/votiakov/airq/internal/telemetry"
 )
@@ -35,7 +38,13 @@ type Options struct {
 	// behind a long transaction fails instead of blocking all traffic behind it.
 	LockTimeout     time.Duration
 	ApplicationName string
+	// TracerProvider defaults to the global provider. Queries become child spans of
+	// the caller's span (otelpgx); queries without a parent span are not traced.
+	TracerProvider trace.TracerProvider
 }
+
+// tracerName is the instrumentation scope for spans created by this package.
+const tracerName = "github.com/votiakov/airq/internal/store"
 
 // Open configures a *sql.DB backed by pgx. It does not connect; use Ping. Server-side
 // guards are set per session: statement_timeout stops runaway queries,
@@ -64,6 +73,14 @@ func Open(opts Options) (*sql.DB, error) {
 	if lt := cmp.Or(opts.LockTimeout, opts.StatementTimeout); lt > 0 {
 		cfg.RuntimeParams["lock_timeout"] = ms(lt)
 	}
+
+	if opts.TracerProvider == nil {
+		opts.TracerProvider = otel.GetTracerProvider()
+	}
+	cfg.Tracer = otelpgx.NewTracer(
+		otelpgx.WithTracerProvider(opts.TracerProvider),
+		otelpgx.WithDisableConnectionDetailsInAttributes(), // host/user add nothing per span
+	)
 
 	db := stdlib.OpenDB(*cfg)
 	db.SetMaxOpenConns(opts.MaxOpenConns)

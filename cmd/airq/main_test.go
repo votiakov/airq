@@ -320,3 +320,31 @@ func createDatabase(t *testing.T, admin string) string {
 	u.Path = "/" + name
 	return u.String()
 }
+
+func TestServeExportsTraces(t *testing.T) {
+	var mu sync.Mutex
+	var batches int
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/traces" {
+			mu.Lock()
+			batches++
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer collector.Close()
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", collector.URL) // read by the OTLP exporter itself
+
+	inst := start(t, map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": collector.URL})
+	resp, _ := inst.get(t, "/v1/air-quality/current?lat=52.52&lon=13.41")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	inst.stop(t) // shutdown flushes buffered spans
+
+	mu.Lock()
+	defer mu.Unlock()
+	if batches == 0 {
+		t.Fatal("no spans were exported to the OTLP endpoint")
+	}
+}

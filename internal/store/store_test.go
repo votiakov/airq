@@ -18,6 +18,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/votiakov/airq/internal/upstream"
 	"github.com/votiakov/airq/migrations"
@@ -469,5 +472,58 @@ func TestOpenLockTimeoutWithoutStatementTimeout(t *testing.T) {
 	}
 	if stmt != "0" || lockT != "10s" {
 		t.Errorf("statement_timeout=%q lock_timeout=%q, want 0 and 10s (migration session)", stmt, lockT)
+	}
+}
+
+func TestRecorderTracesBatchesWithLinksToRequests(t *testing.T) {
+	spans := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans))
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp) // picked up by Open (otelpgx) and NewRecorder
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+
+	db := migrated(t)
+	reg := prometheus.NewRegistry()
+	rec := newRecorder(db, reg, 100)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { rec.Run(ctx, 5*time.Second); close(done) }()
+
+	_, request := tp.Tracer("test").Start(context.Background(), "request")
+	request.End()
+	rec.Record(upstream.Exchange{
+		Time: time.Now(), Upstream: "air_quality", Endpoint: "/v1/air-quality", Attempt: 1,
+		StatusCode: 200, Outcome: "success", Trace: request.SpanContext(),
+	})
+	cancel()
+	<-done
+
+	var write sdktrace.ReadOnlySpan
+	var insert []sdktrace.ReadOnlySpan
+	for _, s := range spans.Ended() {
+		switch {
+		case s.Name() == "recorder.write":
+			write = s
+		case s.Name() == "INSERT":
+			insert = append(insert, s)
+		}
+	}
+	if write == nil {
+		t.Fatal("no recorder.write span")
+	}
+	if write.Parent().IsValid() || len(write.Links()) != 1 || write.Links()[0].SpanContext.SpanID() != request.SpanContext().SpanID() {
+		t.Errorf("recorder.write must be a root span linked to the request: parent=%v links=%v", write.Parent(), write.Links())
+	}
+	query := 0
+	for _, s := range insert { // otelpgx also emits a nested span for the implicit prepare
+		if s.SpanContext().TraceID() != write.SpanContext().TraceID() {
+			t.Error("pgx spans must belong to the recorder.write trace")
+		}
+		if s.Parent().SpanID() == write.SpanContext().SpanID() {
+			query++
+		}
+	}
+	if query != 1 {
+		t.Errorf("expected one pgx INSERT span under recorder.write, got %d", query)
 	}
 }

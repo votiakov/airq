@@ -8,6 +8,10 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/votiakov/airq/internal/telemetry"
 )
@@ -22,6 +26,8 @@ type RetentionOptions struct {
 	BatchSize  int
 	Registerer prometheus.Registerer
 	Logger     *slog.Logger
+	// TracerProvider defaults to the global provider.
+	TracerProvider trace.TracerProvider
 }
 
 // Retention deletes upstream_responses rows older than MaxAge. Deletes run in small
@@ -32,6 +38,7 @@ type Retention struct {
 	opts    RetentionOptions
 	queries *Metrics
 	log     *slog.Logger
+	tracer  trace.Tracer
 
 	deleted     prometheus.Counter
 	runs        *prometheus.CounterVec
@@ -46,9 +53,13 @@ func NewRetention(db *sql.DB, queries *Metrics, opts RetentionOptions) *Retentio
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
+	if opts.TracerProvider == nil {
+		opts.TracerProvider = otel.GetTracerProvider()
+	}
 	r := &Retention{
 		db: db, opts: opts, queries: queries,
-		log: opts.Logger.With(slog.String("component", "retention")),
+		log:    opts.Logger.With(slog.String("component", "retention")),
+		tracer: opts.TracerProvider.Tracer(tracerName),
 		deleted: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: telemetry.Namespace, Subsystem: "retention", Name: "deleted_rows_total",
 			Help: "Rows deleted by the retention job.",
@@ -87,11 +98,16 @@ func (r *Retention) Run(ctx context.Context) {
 
 // RunOnce deletes expired rows and returns how many were removed.
 func (r *Retention) RunOnce(ctx context.Context) (int64, error) {
+	ctx, span := r.tracer.Start(ctx, "retention.run", trace.WithNewRoot())
+	defer span.End()
+
 	start := time.Now()
 	n, locked, err := r.prune(ctx)
 	r.queries.observe("retention_prune", start, err)
+	span.SetAttributes(attribute.Int64("airq.deleted_rows", n), attribute.Bool("airq.lock_acquired", locked))
 	switch {
 	case err != nil:
+		span.SetStatus(codes.Error, err.Error())
 		r.runs.WithLabelValues("error").Inc()
 		return n, err
 	case !locked:
