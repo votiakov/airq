@@ -1,0 +1,27 @@
+# Override: replace Open-Meteo with the fault-injectable emulator.
+#
+#   docker compose -f compose.yaml -f compose.mock.yaml up --build
+#
+# Inject failures (see README "Chaos drills"):
+#   curl -X POST 'localhost:8090/__faults?failure_rate=1&status=503'
+#   curl -X DELETE localhost:8090/__faults
+services:
+  mockvendor:
+    image: airq-mockvendor:local
+    build:
+      context: .
+      target: mockvendor
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "${MOCK_PORT:-8090}:8090"
+    restart: unless-stopped
+
+  airq:
+    environment:
+      UPSTREAM_AIR_QUALITY_URL: http://mockvendor:8090
+      UPSTREAM_GEOCODING_URL: http://mockvendor:8090
+    depends_on:
+      mockvendor:
+        condition: service_healthy

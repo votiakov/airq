@@ -1,0 +1,128 @@
+# Local stack: `docker compose up --build`, then open http://localhost:8080.
+#
+#   airq        the service (http://localhost:8080), calling the real Open-Meteo APIs
+#   migrate     one-shot schema migration as the DDL role, before airq starts
+#   postgres    audit log storage (not published to the host; use `make psql`)
+#   prometheus  http://localhost:9090  (scrapes airq, evaluates SLO and alert rules)
+#   grafana     http://localhost:3000  ("airq overview" dashboard, anonymous viewer)
+#   jaeger      http://localhost:16686 (traces exported by airq over OTLP)
+#
+# For an offline, deterministic vendor with fault injection add the mock override:
+#   docker compose -f compose.yaml -f compose.mock.yaml up --build
+name: airq
+
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+x-airq-build: &airq-build
+  context: .
+  target: runtime
+  args:
+    VERSION: ${AIRQ_VERSION:-dev}
+    REVISION: ${AIRQ_REVISION:-unknown}
+
+services:
+  postgres:
+    image: postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: airq
+      AIRQ_MIGRATOR_PASSWORD: ${AIRQ_MIGRATOR_PASSWORD:-migrator}
+      AIRQ_APP_PASSWORD: ${AIRQ_APP_PASSWORD:-app}
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./deploy/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d airq"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  migrate:
+    image: airq:local
+    build: *airq-build
+    <<: *hardened
+    command: ["migrate", "up"]
+    environment:
+      MIGRATE_DATABASE_URL: postgres://airq_migrator:${AIRQ_MIGRATOR_PASSWORD:-migrator}@postgres:5432/airq?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  airq:
+    image: airq:local
+    build: *airq-build
+    <<: *hardened
+    environment:
+      DATABASE_URL: postgres://airq_app:${AIRQ_APP_PASSWORD:-app}@postgres:5432/airq?sslmode=disable
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      # Keep the Go heap under the container limit so GC works harder before the OOM killer.
+      GOMEMLIMIT: 200MiB
+    ports:
+      - "${AIRQ_PORT:-8080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      jaeger:
+        condition: service_started
+    # HTTP_DRAIN_DELAY (5s) + HTTP_SHUTDOWN_TIMEOUT (20s) + flush headroom.
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256M
+          pids: 256
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+      - prometheus:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/airq.json
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0@sha256:836b967b5abcf1f7758066aa6b348619267a2f1459f72d472840570f9bd88a17
+    ports:
+      - "${JAEGER_PORT:-16686}:16686"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  prometheus:
+  grafana:
