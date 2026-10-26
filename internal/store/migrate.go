@@ -196,14 +196,22 @@ func (m *Migrator) Status(ctx context.Context) ([]MigrationStatus, error) {
 	return out, err
 }
 
-// Pending returns how many migrations are not yet applied, without taking the lock.
+// Pending returns how many migrations are not yet applied. It is read-only (no lock,
+// no DDL) so the least-privileged runtime role can call it from health checks.
 func (m *Migrator) Pending(ctx context.Context) (int, error) {
 	conn, err := m.db.Conn(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = conn.Close() }()
-	state, err := m.appliedState(ctx, conn)
+	var exists bool
+	if err := conn.QueryRowContext(ctx, `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&exists); err != nil {
+		return 0, err
+	}
+	if !exists {
+		return len(m.migrations), nil
+	}
+	state, err := m.readState(ctx, conn)
 	if err != nil {
 		return 0, err
 	}
@@ -255,8 +263,9 @@ type appliedMigration struct {
 	appliedAt time.Time
 }
 
-// appliedState reads schema_migrations and verifies that applied migrations have not
-// been edited since (checksum drift), which would mean environments diverge.
+// appliedState ensures schema_migrations exists, then reads it and verifies that
+// applied migrations have not been edited since (checksum drift), which would mean
+// environments diverge.
 func (m *Migrator) appliedState(ctx context.Context, conn *sql.Conn) (map[int64]appliedMigration, error) {
 	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version      bigint      PRIMARY KEY,
@@ -267,6 +276,11 @@ func (m *Migrator) appliedState(ctx context.Context, conn *sql.Conn) (map[int64]
 	)`); err != nil {
 		return nil, fmt.Errorf("ensure schema_migrations: %w", err)
 	}
+	return m.readState(ctx, conn)
+}
+
+// readState reads schema_migrations and verifies checksums of applied migrations.
+func (m *Migrator) readState(ctx context.Context, conn *sql.Conn) (map[int64]appliedMigration, error) {
 	rows, err := conn.QueryContext(ctx, `SELECT version, checksum, applied_at FROM schema_migrations`)
 	if err != nil {
 		return nil, fmt.Errorf("read schema_migrations: %w", err)
